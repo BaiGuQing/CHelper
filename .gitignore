@@ -1,0 +1,42 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Runtime cache & debug output
+.cache/
+.debug/
+
+# Log files
+*.log
+
+# ===== Large binaries (not tracked in git) =====
+# Model weights
+*.gguf
+*.gguf.tmp
+*.safetensors
+*.bin
+VibeThinker-3B/
+
+# Bundled llama.cpp binaries (~1.1 GB, download separately)
+.llama_bin/
+
+# vLLM / Ollama local model dirs
+*.vllm/
+
+# ===== IDE / editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Backups =====
+*.bak
+*.tmp
