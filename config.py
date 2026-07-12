@@ -5,6 +5,7 @@ CHelper - IDA Pro反编译代码优化插件配置
 
 import os
 import json
+import copy
 
 class Config:
     """插件配置管理"""
@@ -12,39 +13,58 @@ class Config:
     # 默认配置
     DEFAULT_CONFIG = {
         "llm": {
-            "api_url": "http://localhost:8000/v1/chat/completions",  # OpenAI兼容API地址
-            "model": "VibeThinker-3B",
-            "temperature": 0.3,
-            "max_tokens": 4096,
-            "timeout": 180,
+            "api_url": "http://127.0.0.1:11434/v1/chat/completions",  # Ollama OpenAI兼容API
+            "model": "qwen2.5-coder:7b",
+            "temperature": 0.0,
+            "max_tokens": 2048,
+            "timeout": 300,
             "api_key": "",  # 本地模型通常不需要
-            "strip_reasoning": True,  # 剥离推理模型的<think>块
-            "reasoning_tags": ["think", "thinking"],  # 需要剥离的推理标签
-            "auto_start": True,  # 插件加载时自动检测并启动 LLM 服务
-            "backend": "llama_cpp",  # 后端类型: "llama_cpp" 或 "vllm"
-            "model_path": "",  # 模型权重路径，空则自动查找（llama_cpp找.gguf，vllm找目录）
+            "strip_reasoning": False,  # Qwen Coder 非推理模型无需剥离 <think>
+            "reasoning_tags": ["think", "thinking"],
+            "auto_start": False,  # Ollama 由用户服务管理，不启动额外 llama-server
+            "backend": "llama_cpp",  # "llama_cpp" | "vllm" | "openai"
+            "model_path": "",  # 外部 Ollama 端点无需本地模型路径
             "vllm_binary": "vllm",  # vLLM 可执行文件名
             "llama_server_binary": "",  # llama-server 路径，空则自动找插件目录/.llama_bin/
             "n_gpu_layers": -1,  # llama.cpp  offload 到 GPU 的层数，-1 表示全部
             "context_size": 8192,  # llama.cpp 上下文长度
             "startup_timeout": 180,  # 服务启动超时（秒）
             # --- 重复退化抑制（治小模型重复输出的 bug） ---
-            "repeat_penalty": 1.15,  # llama.cpp 重复惩罚，>1 抑制重复 token
-            "frequency_penalty": 0.3,  # OpenAI 风格频率惩罚
-            "presence_penalty": 0.3,  # OpenAI 风格存在惩罚
+            "repeat_penalty": 1.05,  # C 代码需要重复变量名和调用，保持轻度惩罚
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            # 严格 OpenAI 兼容服务可能拒绝 top_k、min_p 等扩展字段。
+            "send_extended_parameters": False,
+            "top_p": 0.95,
+            "top_k": 40,
+            "min_p": 0.0,
+            # 推理模板会消耗 token 且容易让小模型在最终代码前跑偏。
+            # llama.cpp 后端可用 "off" / "on" / "auto"。
+            "reasoning": "off",
+            # llama.cpp：0 表示立即结束 <think>，避免推理模型挤占代码 token。
+            "reasoning_budget": 0,
             # --- 保守模式（治小模型重建复杂逻辑失败） ---
-            # "off" 总是全量优化；"on" 总是保守(只改名+注释)；"auto" 自动检测硬骨头走保守
-            "conservative_mode": "auto",
+            # IDA 伪代码包含 ABI、全局符号等高风险细节；默认只做保守美化。
+            "conservative_mode": "on",
             "degeneration_guard": True,  # 后处理退化检测兜底，发现重复行自动截断
+            # on/auto 要求保留高信号锚点；off 仍检查签名、长度和新增调用。
+            "quality_guard": True,
+            "minimum_output_ratio": 0.45,
+            # 参数在函数体内完全未使用时，恢复模型误改的 IDA ABI 签名。
+            "restore_unused_parameter_signature": True,
+            # 保守模型输出只能改局部标识符；无变化/失败时使用确定性本地美化。
+            "local_readability_fallback": True,
+            # 质量门拒绝完整输出后，仅以原始伪代码为权威进行一次修复请求。
+            "quality_repair_attempts": 1,
+            # 设为整数可复现采样；None 使用后端默认随机种子。
+            "seed": None,
             # --- 网络重试 ---
             "max_retry_attempts": 3,  # 最大重试次数
             "retry_delay": 1.0,  # 初始重试延迟（秒）
         },
         "plugin": {
-            "hotkey": "Ctrl+Shift+C",
-            "hotkey_force": "Ctrl+Shift+R",  # 强制刷新快捷键（忽略缓存）
-            "show_diff": True,
-            "auto_apply": False,  # 是否自动应用优化后的代码
+            "hotkey": "Ctrl+Alt+C",
+            "hotkey_force": "Ctrl+Alt+R",  # 强制刷新快捷键（忽略缓存）
             "max_function_size": 10000,  # 最大处理函数大小（字符）
             # --- 日志配置 ---
             "debug": False,  # 调试模式
@@ -54,15 +74,14 @@ class Config:
             "cache_dir": ".cache",  # 缓存目录（相对插件目录）
             "cache_max_age_days": 30,  # 缓存最大有效期（天）
             "cache_cleanup_on_start": True,  # 启动时清理过期缓存
-            # --- 流式输出 ---
-            "enable_streaming": False,  # 启用流式输出（实验性功能）
         },
         "optimization": {
             "deobfuscate_ollvm": True,
             "simplify_expressions": True,
             "improve_naming": True,
             "add_comments": True,
-            "unroll_simple_loops": False  # 展开简单循环
+            "unroll_simple_loops": False,  # 展开简单循环
+            "rewrite_control_flow": True,  # 允许重写循环/分支结构
         }
     }
 
@@ -87,15 +106,15 @@ class Config:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     user_config = json.load(f)
                 # 合并用户配置和默认配置
-                config = self._merge_config(self.DEFAULT_CONFIG.copy(), user_config)
+                config = self._merge_config(copy.deepcopy(self.DEFAULT_CONFIG), user_config)
                 return config
             except Exception as e:
                 print(f"[CHelper] 加载配置文件失败: {e}，使用默认配置")
-                return self.DEFAULT_CONFIG.copy()
+                return copy.deepcopy(self.DEFAULT_CONFIG)
         else:
             # 创建默认配置文件
             self.save_config(self.DEFAULT_CONFIG)
-            return self.DEFAULT_CONFIG.copy()
+            return copy.deepcopy(self.DEFAULT_CONFIG)
 
     def _merge_config(self, default, user):
         """递归合并配置"""

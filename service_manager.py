@@ -15,12 +15,13 @@ import socket
 import threading
 import subprocess
 import json
+import shutil
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse
 
-from logger import get_logger
-from constants import (
+from .logger import get_logger
+from .constants import (
     SERVICE_POLL_INTERVAL,
     API_READY_TIMEOUT,
     PORT_CONNECT_TIMEOUT,
@@ -29,7 +30,7 @@ from constants import (
 
 
 class LLMServiceManager:
-    """管理本地 LLM 服务（vLLM）的启动和状态检测"""
+    """管理本地 LLM 服务（vLLM/llama.cpp）的启动和状态检测"""
 
     def __init__(self, config):
         self.config = config
@@ -41,8 +42,14 @@ class LLMServiceManager:
         self.llama_server_binary = config.get("llm.llama_server_binary", "")
         self.llama_n_gpu_layers = config.get("llm.n_gpu_layers", -1)
         self.llama_context_size = config.get("llm.context_size", 8192)
+        self.llama_reasoning = str(config.get("llm.reasoning", "off") or "off").lower()
+        try:
+            self.llama_reasoning_budget = int(config.get("llm.reasoning_budget", 0))
+        except (TypeError, ValueError):
+            self.llama_reasoning_budget = None
         self.startup_timeout = config.get("llm.startup_timeout", DEFAULT_STARTUP_TIMEOUT)
         self.logger = get_logger()
+        self.external_backend = self.backend == "openai"
 
         # 状态: "idle" / "starting" / "ready" / "failed" / "disabled"
         self._status = "idle"
@@ -59,6 +66,16 @@ class LLMServiceManager:
             default_bin = os.path.join(self._plugin_dir, ".llama_bin", "llama-server.exe")
             if sys.platform == "win32" and os.path.isfile(default_bin):
                 self.llama_server_binary = default_bin
+            else:
+                self.llama_server_binary = (
+                    shutil.which("llama-server")
+                    or shutil.which("llama-server.exe")
+                    or ""
+                )
+        elif not os.path.isabs(self.llama_server_binary):
+            plugin_binary = os.path.join(self._plugin_dir, self.llama_server_binary)
+            if os.path.isfile(plugin_binary):
+                self.llama_server_binary = plugin_binary
 
     def _resolve_model_path(self) -> str:
         """解析模型权重路径
@@ -145,7 +162,11 @@ class LLMServiceManager:
             base_url = f"{parsed.scheme}://{parsed.netloc}"
             models_url = f"{base_url}/v1/models"
 
-            req = urllib.request.Request(models_url, method="GET")
+            headers = {}
+            api_key = self.config.get("llm.api_key", "")
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            req = urllib.request.Request(models_url, headers=headers, method="GET")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
                     return True
@@ -210,6 +231,14 @@ class LLMServiceManager:
             str(self.llama_n_gpu_layers),
             "--jinja",
         ]
+        # DeepSeek-R1 style GGUF templates often append `<think>` before every
+        # answer.  For code rewriting, a small model can spend its entire
+        # budget reasoning and never emit a valid function.  Let users opt
+        # back in through config while keeping safe code output as the default.
+        if self.llama_reasoning in ("on", "off", "auto"):
+            cmd.extend(["--reasoning", self.llama_reasoning])
+        if self.llama_reasoning_budget is not None:
+            cmd.extend(["--reasoning-budget", str(self.llama_reasoning_budget)])
         return cmd
 
     def _start_service(self, model_path: str, host: str, port: int) -> bool:
@@ -224,6 +253,11 @@ class LLMServiceManager:
             进程启动成功返回True（不等于服务就绪）
         """
         if self.backend == "llama_cpp":
+            if self.llama_server_binary and not os.path.isfile(self.llama_server_binary):
+                # Also support a llama-server executable available on PATH.
+                resolved = shutil.which(self.llama_server_binary)
+                if resolved:
+                    self.llama_server_binary = resolved
             if not self.llama_server_binary or not os.path.isfile(self.llama_server_binary):
                 self._error = (
                     f"找不到 llama-server 可执行文件。请在 config.json 的 "
@@ -265,7 +299,23 @@ class LLMServiceManager:
     def _print(self, msg: str):
         """打印到 IDA 输出窗口（线程安全方式）"""
         self.logger.info(msg)
-        print(f"[CHelper] {msg}")
+
+    def stop(self):
+        """Stop a process started by this manager, if any."""
+        with self._lock:
+            process = self._process
+            self._process = None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:
+                pass
 
     def _run_async(self):
         """后台线程主逻辑：检测 -> 启动 -> 轮询就绪"""
@@ -323,6 +373,7 @@ class LLMServiceManager:
                     f"{bin_label} 启动超时（{self.startup_timeout}秒），"
                     f"可能是模型过大或显存不足。可调大 config.json 的 startup_timeout"
                 )
+                self.stop()
                 self._print(self._error)
                 with self._lock:
                     self._status = "failed"
@@ -353,10 +404,17 @@ class LLMServiceManager:
     def start_check_async(self):
         """异步启动状态检测（不阻塞 IDA 加载）
 
-        插件 init 时调用，后台线程会自动检测/启动 vLLM。
+        插件 init 时调用，后台线程会自动检测/启动本地服务。
+        OpenAI 兼容在线端点不由插件启动或轮询。
         """
         if not self.api_url:
             self._print("警告: llm.api_url 未配置，跳过服务管理")
+            return
+
+        if self.external_backend:
+            with self._lock:
+                self._status = "ready"
+            self._print("OpenAI 兼容在线模型模式已启用，跳过本地服务管理")
             return
 
         thread = threading.Thread(target=self._run_async, daemon=True)
@@ -394,6 +452,10 @@ class LLMServiceManager:
         Returns:
             就绪返回True
         """
+        if self.external_backend:
+            with self._lock:
+                self._status = "ready"
+            return True
         if self._is_api_ready():
             with self._lock:
                 self._status = "ready"
@@ -425,6 +487,6 @@ def get_service_manager() -> LLMServiceManager:
     global _global_service_manager
     if _global_service_manager is None:
         # 兜底：未初始化时创建一个（不会自动启动）
-        from config import get_config
+        from .config import get_config
         _global_service_manager = LLMServiceManager(get_config())
     return _global_service_manager

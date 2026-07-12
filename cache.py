@@ -10,6 +10,11 @@ import time
 from typing import Optional, Dict, Any
 
 
+# v3 invalidates entries produced before semantic validation.  Earlier
+# versions could cache the original code after an invalid model response.
+CACHE_SCHEMA_VERSION = 3
+
+
 class OptimizationCache:
     """优化结果缓存
 
@@ -25,7 +30,7 @@ class OptimizationCache:
     }
     """
 
-    def __init__(self, cache_dir: str, max_age_days: int = 30):
+    def __init__(self, cache_dir: str, max_age_days: int = 30, namespace: str = ""):
         """初始化缓存
 
         Args:
@@ -34,6 +39,10 @@ class OptimizationCache:
         """
         self.cache_dir = cache_dir
         self.max_age_seconds = max_age_days * 86400
+        # The namespace changes when model/prompt/config inputs change. This
+        # prevents a result produced by one model or configuration from being
+        # silently reused by another.
+        self.namespace = namespace or "default"
         self._ensure_cache_dir()
 
     def _ensure_cache_dir(self):
@@ -43,7 +52,7 @@ class OptimizationCache:
         except Exception as e:
             print(f"[CHelper Cache] 创建缓存目录失败: {e}")
 
-    def _compute_hash(self, address: str, pseudocode: str) -> str:
+    def _compute_hash(self, address: str, pseudocode: str, metadata: Optional[Dict[str, Any]] = None) -> str:
         """计算缓存键的哈希值
 
         Args:
@@ -53,7 +62,14 @@ class OptimizationCache:
         Returns:
             SHA256 哈希值
         """
-        content = f"{address}:{pseudocode}"
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        content = json.dumps({
+            "schema": CACHE_SCHEMA_VERSION,
+            "namespace": self.namespace,
+            "address": address,
+            "pseudocode": pseudocode,
+            "metadata": metadata_json,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(content.encode('utf-8')).hexdigest()
 
     def _get_cache_path(self, cache_hash: str) -> str:
@@ -67,7 +83,12 @@ class OptimizationCache:
         """
         return os.path.join(self.cache_dir, f"{cache_hash}.json")
 
-    def get(self, address: str, pseudocode: str) -> Optional[Dict[str, Any]]:
+    def get(
+        self,
+        address: str,
+        pseudocode: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """从缓存获取优化结果
 
         Args:
@@ -77,7 +98,7 @@ class OptimizationCache:
         Returns:
             缓存的优化结果，未命中返回 None
         """
-        cache_hash = self._compute_hash(address, pseudocode)
+        cache_hash = self._compute_hash(address, pseudocode, metadata)
         cache_path = self._get_cache_path(cache_hash)
 
         if not os.path.exists(cache_path):
@@ -86,6 +107,12 @@ class OptimizationCache:
         try:
             with open(cache_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+
+            # Old cache files intentionally miss after the schema change.
+            if data.get("schema_version") != CACHE_SCHEMA_VERSION:
+                return None
+            if data.get("hash") != cache_hash:
+                return None
 
             # 检查缓存是否过期
             timestamp = data.get("timestamp", 0)
@@ -106,7 +133,8 @@ class OptimizationCache:
         pseudocode: str,
         optimized_code: str,
         function_name: str = "",
-        stats: Optional[Dict[str, Any]] = None
+        stats: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         """保存优化结果到缓存
 
@@ -117,24 +145,36 @@ class OptimizationCache:
             function_name: 函数名
             stats: 统计信息
         """
-        cache_hash = self._compute_hash(address, pseudocode)
+        cache_hash = self._compute_hash(address, pseudocode, metadata)
         cache_path = self._get_cache_path(cache_hash)
 
         data = {
+            "schema_version": CACHE_SCHEMA_VERSION,
             "hash": cache_hash,
+            "namespace": self.namespace,
             "timestamp": time.time(),
             "function_name": function_name,
             "address": address,
             "original_code": pseudocode,
             "optimized_code": optimized_code,
-            "stats": stats or {}
+            "stats": stats or {},
+            "metadata": metadata or {},
         }
 
+        temp_path = cache_path + ".tmp"
         try:
-            with open(cache_path, 'w', encoding='utf-8') as f:
+            # Atomic replacement prevents a killed IDA process from leaving a
+            # partially-written JSON file that can poison future lookups.
+            with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_path, cache_path)
         except Exception as e:
             print(f"[CHelper Cache] 保存缓存失败: {e}")
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
 
     def clear(self) -> int:
         """清空所有缓存
@@ -252,7 +292,29 @@ def init_cache(config) -> OptimizationCache:
             cache_dir = os.path.join(plugin_dir, cache_dir)
 
         max_age_days = config.get("plugin.cache_max_age_days", 30)
-        _global_cache = OptimizationCache(cache_dir, max_age_days)
+        # Keep secrets such as api_key out of the namespace while including
+        # every setting that can affect the generated result.
+        namespace_payload = {
+            "plugin_version": "1.3.1",
+            "prompt_version": "safe-c-v8",
+            "llm": {
+                key: config.get(f"llm.{key}")
+                for key in (
+                    "model", "temperature", "max_tokens", "repeat_penalty",
+                    "frequency_penalty", "presence_penalty", "top_p", "top_k",
+                    "min_p", "send_extended_parameters", "conservative_mode",
+                    "backend", "api_url",
+                    "strip_reasoning", "reasoning_tags", "reasoning", "reasoning_budget", "seed",
+                    "quality_guard", "minimum_output_ratio", "restore_unused_parameter_signature",
+                    "quality_repair_attempts", "local_readability_fallback",
+                )
+            },
+            "optimization": config.get("optimization", {}),
+        }
+        namespace = hashlib.sha256(
+            json.dumps(namespace_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        _global_cache = OptimizationCache(cache_dir, max_age_days, namespace)
 
         # 启动时清理过期缓存
         if config.get("plugin.cache_cleanup_on_start", True):

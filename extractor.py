@@ -3,13 +3,19 @@
 代码提取器 - 从IDA中提取伪C代码和上下文信息
 """
 
+import re
+
 import ida_hexrays
 import ida_kernwin
+import ida_lines
 import ida_funcs
 import ida_name
 import ida_nalt
 import ida_typeinf
 import idaapi
+
+
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 
 
 class CodeExtractor:
@@ -136,6 +142,64 @@ class CodeExtractor:
             return ""
 
     @staticmethod
+    def get_semantic_colors(cfunc) -> dict:
+        """Extract Hex-Rays token colors for reuse in the result viewer.
+
+        ``str(cfunc)`` is intentionally plain text for the LLM, while
+        ``cfunc.get_pseudocode()`` contains the semantic color tags used by
+        the native pseudocode widget. Keeping a small identifier-to-tag map
+        lets renamed locals retain the same visual language in the custom
+        viewer without copying Hex-Rays' hidden line anchors.
+        """
+        if cfunc is None:
+            return {}
+
+        allowed_colors = {
+            getattr(ida_lines, name)
+            for name in (
+                "SCOLOR_KEYWORD",
+                "SCOLOR_DNAME",
+                "SCOLOR_LOCNAME",
+                "SCOLOR_CNAME",
+                "SCOLOR_IMPNAME",
+                "SCOLOR_LIBNAME",
+                "SCOLOR_UNAME",
+                "SCOLOR_TYPE",
+            )
+            if hasattr(ida_lines, name)
+        }
+        if not allowed_colors:
+            return {}
+
+        on = re.escape(ida_lines.SCOLOR_ON)
+        off = re.escape(ida_lines.SCOLOR_OFF)
+        span_re = re.compile(
+            rf"{on}(?P<tag>.)(?P<text>.*?){off}(?P=tag)",
+            re.DOTALL,
+        )
+        counts = {}
+        try:
+            colored_lines = cfunc.get_pseudocode()
+            for raw_line in colored_lines:
+                line = str(getattr(raw_line, "line", raw_line))
+                for match in span_re.finditer(line):
+                    color = match.group("tag")
+                    if color not in allowed_colors:
+                        continue
+                    visible = ida_lines.tag_remove(match.group("text"))
+                    for word in _IDENTIFIER_RE.findall(visible):
+                        per_color = counts.setdefault(word, {})
+                        per_color[color] = per_color.get(color, 0) + 1
+        except Exception as exc:
+            print(f"[CHelper] 获取伪代码语义颜色失败: {exc}")
+            return {}
+
+        return {
+            word: max(per_color.items(), key=lambda item: item[1])[0]
+            for word, per_color in counts.items()
+        }
+
+    @staticmethod
     def extract_context(func, cfunc) -> dict:
         """提取完整的上下文信息
 
@@ -152,6 +216,9 @@ class CodeExtractor:
             "types": CodeExtractor.get_local_types(cfunc),
             "address": f"0x{func.start_ea:X}" if func else "",
         }
+        semantic_colors = CodeExtractor.get_semantic_colors(cfunc)
+        if semantic_colors:
+            context["semantic_colors"] = semantic_colors
 
         return context
 

@@ -5,16 +5,17 @@
 
 import ida_kernwin
 import ida_hexrays
+import threading
+import time
 
-from config import get_config
-from extractor import CodeExtractor
-from llm_client import LLMClient
-from processor import CodeProcessor
-from presenter import ResultPresenter, ProgressDialog
-from service_manager import get_service_manager
-from logger import get_logger
-from cache import get_cache
-from result import Result, ErrorCode
+from .config import get_config
+from .extractor import CodeExtractor
+from .llm_client import LLMClient
+from .processor import CodeProcessor
+from .presenter import ResultPresenter, ProgressDialog
+from .service_manager import get_service_manager
+from .logger import get_logger
+from .cache import get_cache
 
 
 class OptimizationHandler:
@@ -25,6 +26,363 @@ class OptimizationHandler:
         self.llm_client = LLMClient(self.config)
         self.logger = get_logger()
         self.cache = get_cache()
+        self._busy_lock = threading.Lock()
+        self._busy = False
+
+    def _ensure_service_ready(self) -> bool:
+        """Check service state and show a useful message when it is unavailable."""
+        svc = get_service_manager()
+        if svc.is_ready() or svc.check_now():
+            return True
+
+        status = svc.get_status()
+        hotkey = self.config.get("plugin.hotkey", "Ctrl+Alt+C")
+        if status == "starting":
+            elapsed = svc.get_elapsed()
+            ResultPresenter.show_info(
+                f"模型服务正在启动中（已等待 {elapsed} 秒），\n"
+                f"模型加载到显存可能需要一段时间，\n"
+                f"请稍后再按 {hotkey} 重试。"
+            )
+            return False
+        if status == "failed":
+            ResultPresenter.show_error(
+                f"模型服务启动失败：{svc.get_error()}\n"
+                f"请检查 config.json 的 auto_start/model_path 配置，\n"
+                f"或手动启动模型服务后重试。"
+            )
+            return False
+
+        # ``disabled`` means auto_start is off. Let the request proceed so a
+        # manually managed endpoint can still be used; requests will report a
+        # concrete connection error if it is actually unavailable.
+        return True
+
+    @staticmethod
+    def _is_non_modal_model_rejection(message: str) -> bool:
+        """Return True for expected bad-model output, not plugin failures."""
+        markers = (
+            "模型输出未通过安全校验",
+            "模型未输出完整函数",
+            "模型输出达到 max_tokens 限制",
+            "模型没有返回可用的最终代码",
+            "LLM优化失败",
+            "模型未产生可安全应用的改动",
+            "模型输出未通过保守改写校验",
+        )
+        return any(marker in (message or "") for marker in markers)
+
+    def _report_failure(self, message: str):
+        """Keep expected model rejections in IDA's Output window, not modals."""
+        if self._is_non_modal_model_rejection(message):
+            self.logger.warning(message)
+            response_info = self.llm_client.get_last_response_info()
+            if response_info:
+                usage = response_info.get("usage") or {}
+                self.logger.info(
+                    "模型响应元数据: finish_reason=%s, completion_tokens=%s, "
+                    "content=%s 字符, reasoning=%s 字符"
+                    % (
+                        response_info.get("finish_reason", "unknown"),
+                        usage.get("completion_tokens", "unknown"),
+                        response_info.get("content_chars", 0),
+                        response_info.get("reasoning_chars", 0),
+                    )
+                )
+            return
+        ResultPresenter.show_error(message)
+        self.logger.error(message)
+
+    def _format_processing_failure(self, processing_error: str) -> str:
+        """Avoid labelling an intentional safety rejection as a plugin error."""
+        if self._is_non_modal_model_rejection(processing_error):
+            return processing_error
+        return f"代码处理失败: {processing_error}"
+
+    def _get_quality_repair_attempts(self) -> int:
+        """Read the bounded semantic-repair budget from configuration."""
+        try:
+            attempts = int(self.config.get("llm.quality_repair_attempts", 1))
+        except (TypeError, ValueError):
+            attempts = 1
+        # This is deliberately separate from HTTP retries and must never turn
+        # an unreliable model into an unbounded background loop.
+        return min(max(attempts, 0), 3)
+
+    def _apply_local_readability_fallback(self, pseudocode: str) -> tuple:
+        """Return a verified local-only readability pass when it has value."""
+        if not self.config.get("llm.local_readability_fallback", True):
+            return "", {}
+
+        locally_improved, metadata = CodeProcessor.apply_safe_local_readability(pseudocode)
+        if not metadata or not CodeProcessor.has_meaningful_change(
+            pseudocode, locally_improved
+        ):
+            return "", {}
+
+        syntax_ok, _syntax_error = CodeProcessor.basic_syntax_check(locally_improved)
+        semantic_ok, _semantic_error = CodeProcessor.validate_semantic_preservation(
+            pseudocode,
+            locally_improved,
+            self.config.get("llm.minimum_output_ratio", 0.45),
+        )
+        if not syntax_ok or not semantic_ok:
+            return "", {}
+        return locally_improved, metadata
+
+    def _fallback_to_local_readability(self, pseudocode: str, model_reason: str) -> tuple:
+        """Use a local verified rename pass when the model gives no safe value."""
+        local_code, local_metadata = self._apply_local_readability_fallback(pseudocode)
+        if not local_code:
+            return "", False, model_reason
+
+        if model_reason:
+            if model_reason == "自动修复未产生实质改动":
+                reason_text = f"自动保守修复未产生可应用改动（{model_reason}）"
+            else:
+                reason_text = f"未采用模型输出（{model_reason}）"
+            self.logger.warning(
+                "%s，已应用本地安全美化（重命名 %s 个局部变量）"
+                % (reason_text, local_metadata.get("renamed_locals", 0))
+            )
+        else:
+            self.logger.info(
+                "已应用本地安全美化（重命名 %s 个局部变量）"
+                % local_metadata.get("renamed_locals", 0)
+            )
+        local_metadata = dict(local_metadata)
+        local_metadata["result_kind"] = "local_readability_fallback"
+        return local_code, True, {
+            **local_metadata,
+        }
+
+    def _is_conservative_mode(self, pseudocode: str) -> bool:
+        """Return the effective rewrite mode, with a safe test-double fallback."""
+        checker = getattr(self.llm_client, "should_use_conservative", None)
+        if callable(checker):
+            return bool(checker(pseudocode))
+        mode = str(self.config.get("llm.conservative_mode", "on") or "on").lower()
+        return mode != "off"
+
+    def _get_model_result_metadata(self, pseudocode: str, processed_code: str):
+        """Validate local-only edits only when the effective mode is conservative."""
+        conservative = self._is_conservative_mode(pseudocode)
+        rename_valid, rename_error, rename_metadata = (
+            CodeProcessor.validate_local_rename_only(pseudocode, processed_code)
+        )
+        if conservative and not rename_valid:
+            return None, rename_error
+
+        if conservative:
+            return {
+                "result_kind": "model_local_rename",
+                "renamed_locals": len(rename_metadata),
+                "rename_mapping": rename_metadata,
+            }, ""
+
+        # Full rewrites may also rename locals, but token-level mapping is not
+        # reliable after a control-flow or expression transformation.
+        return {
+            "result_kind": "model_full_rewrite",
+            "renamed_locals": len(rename_metadata) if rename_valid else 0,
+            "rename_mapping": rename_metadata if rename_valid else {},
+        }, ""
+
+    @staticmethod
+    def _format_model_validation_failure(rename_error: str, conservative: bool) -> str:
+        mode_label = "保守" if conservative else "全量"
+        return (
+            f"模型输出未通过{mode_label}改写校验: "
+            f"{rename_error}。原始伪代码未被替换，结果未缓存"
+        )
+
+    def _process_model_candidate(self, pseudocode: str, context: dict, candidate: str) -> tuple:
+        """Validate one model output, with at most one bounded semantic repair.
+
+        A repair is only warranted after the semantic guard rejects a complete
+        model answer.  It is not used for connection errors, token truncation,
+        malformed fragments, or syntax failures.  Every repaired candidate
+        goes through the same processor and quality guard again.
+        """
+        processed_code, success, processing_error = CodeProcessor.process(
+            candidate, pseudocode, self.config
+        )
+        if success:
+            result_metadata, rename_error = self._get_model_result_metadata(
+                pseudocode, processed_code
+            )
+            if result_metadata is None:
+                return "", False, (
+                    self._format_model_validation_failure(
+                        rename_error, self._is_conservative_mode(pseudocode)
+                    )
+                )
+            if not CodeProcessor.has_meaningful_change(pseudocode, processed_code):
+                return self._fallback_to_local_readability(
+                    pseudocode, "模型未产生实质改动"
+                )
+            return processed_code, True, result_metadata
+
+        if not CodeProcessor.is_quality_rejection(processing_error):
+            return self._fallback_to_local_readability(pseudocode, processing_error)
+
+        attempts = self._get_quality_repair_attempts()
+        required_anchors = CodeProcessor.get_required_semantic_anchors(pseudocode)
+        conservative = self._is_conservative_mode(pseudocode)
+        repair_label = "自动保守修复" if conservative else "自动全量修复"
+        for attempt in range(1, attempts + 1):
+            violation = CodeProcessor.get_quality_rejection_reason(processing_error)
+            self.logger.info(
+                "模型输出未通过安全校验（%s），正在进行%s（%s/%s）"
+                % (violation or "未保留原始语义", repair_label, attempt, attempts)
+            )
+            repaired_code = self.llm_client.repair_code(
+                pseudocode, context, violation, required_anchors
+            )
+            if repaired_code is None:
+                return "", False, (
+                    self.llm_client.get_last_error()
+                    or "自动安全修复未返回可用代码"
+                )
+
+            processed_code, success, processing_error = CodeProcessor.process(
+                repaired_code, pseudocode, self.config
+            )
+            if success:
+                result_metadata, rename_error = self._get_model_result_metadata(
+                    pseudocode, processed_code
+                )
+                if result_metadata is None:
+                    return "", False, (
+                        self._format_model_validation_failure(
+                            rename_error, conservative
+                        )
+                    )
+                if not CodeProcessor.has_meaningful_change(pseudocode, processed_code):
+                    return self._fallback_to_local_readability(
+                        pseudocode, "自动修复未产生实质改动"
+                    )
+                self.logger.info(f"{repair_label}通过安全校验")
+                return processed_code, True, result_metadata
+            if not CodeProcessor.is_quality_rejection(processing_error):
+                return self._fallback_to_local_readability(pseudocode, processing_error)
+
+        return self._fallback_to_local_readability(pseudocode, processing_error)
+
+    def _publish_result(
+        self,
+        pseudocode: str,
+        processed_code: str,
+        context: dict,
+        address: str,
+        function_name: str,
+        cache_metadata: dict,
+        cache_hit: bool = False,
+        result_metadata: dict = None,
+    ) -> bool:
+        """Publish a validated result on the IDA/UI thread and cache it."""
+        stats = CodeProcessor.calculate_diff_stats(pseudocode, processed_code)
+        result_metadata = result_metadata or {}
+        if not result_metadata:
+            rename_valid, _rename_error, inferred_mapping = (
+                CodeProcessor.validate_local_rename_only(pseudocode, processed_code)
+            )
+            if rename_valid and inferred_mapping:
+                result_metadata = {
+                    "result_kind": "model_local_rename",
+                    "renamed_locals": len(inferred_mapping),
+                    "rename_mapping": inferred_mapping,
+                }
+        result_kind = result_metadata.get("result_kind", "model_local_rename")
+        renamed_locals = int(result_metadata.get("renamed_locals", 0) or 0)
+        stats["result_kind"] = result_kind
+        stats["renamed_locals"] = renamed_locals
+
+        if not CodeProcessor.has_meaningful_change(pseudocode, processed_code):
+            message = "模型未产生可安全应用的改动，已保留原始伪代码"
+            self.logger.warning(message)
+            ResultPresenter.print_to_output(message)
+            return False
+
+        if not cache_hit and self.cache and self.config.get("plugin.enable_cache", True):
+            try:
+                self.cache.set(
+                    address,
+                    pseudocode,
+                    processed_code,
+                    function_name,
+                    stats,
+                    cache_metadata,
+                )
+                self.logger.debug(f"已缓存优化结果: {function_name}")
+            except Exception as exc:
+                self.logger.warning(f"缓存保存失败: {exc}")
+
+        display_context = dict(context or {})
+        display_context["result_kind"] = result_kind
+        display_context["renamed_locals"] = renamed_locals
+        # Carry Hex-Rays' native token colors over to renamed locals. Cached
+        # results do not persist this map, so infer the mapping again when
+        # necessary from the already validated source/result pair.
+        semantic_colors = dict(display_context.get("semantic_colors") or {})
+        rename_mapping = result_metadata.get("rename_mapping") or {}
+        if not rename_mapping:
+            try:
+                _valid, _error, rename_mapping = (
+                    CodeProcessor.validate_local_rename_only(
+                        pseudocode, processed_code
+                    )
+                )
+            except Exception:
+                rename_mapping = {}
+        for source_name, renamed_name in rename_mapping.items():
+            source_color = semantic_colors.get(source_name)
+            if source_color and isinstance(renamed_name, str):
+                semantic_colors.setdefault(renamed_name, source_color)
+        if semantic_colors:
+            display_context["semantic_colors"] = semantic_colors
+        if not ResultPresenter.show_optimized_window(processed_code, display_context, stats):
+            return False
+
+        cache_suffix = " (缓存)" if cache_hit else ""
+        source_label = (
+            "本地安全美化"
+            if result_kind == "local_readability_fallback"
+            else "模型全量重写"
+            if result_kind == "model_full_rewrite"
+            else "模型保守美化"
+        )
+        rename_suffix = f"，重命名 {renamed_locals} 个局部变量" if renamed_locals else ""
+        result_msg = (
+            f"{source_label}完成{cache_suffix}: {stats['original_lines']} -> {stats['optimized_lines']} 行, "
+            f"{stats['original_chars']} -> {stats['optimized_chars']} 字符{rename_suffix}"
+        )
+        ResultPresenter.print_to_output(result_msg)
+        self.logger.info(result_msg)
+        return True
+
+    def _get_cached_result_metadata(self, pseudocode: str, cached: dict) -> dict:
+        """Recover display metadata from a cache entry without trusting old no-ops."""
+        cached_code = (cached or {}).get("optimized_code", "")
+        if not cached_code or not CodeProcessor.has_meaningful_change(
+            pseudocode, cached_code
+        ):
+            return {}
+        stats = (cached or {}).get("stats") or {}
+        result_kind = stats.get("result_kind", "model_local_rename")
+        renamed_locals = stats.get("renamed_locals", 0)
+        return {
+            "result_kind": result_kind,
+            "renamed_locals": renamed_locals,
+        }
+
+    @staticmethod
+    def _is_usable_cached_result(pseudocode: str, cached: dict) -> bool:
+        """Do not reuse pre-v4 whitespace-only cache entries."""
+        cached_code = (cached or {}).get("optimized_code", "")
+        return bool(cached_code and CodeProcessor.has_meaningful_change(
+            pseudocode, cached_code
+        ))
 
     def can_execute(self) -> tuple:
         """检查是否可以执行优化
@@ -70,25 +428,8 @@ class OptimizationHandler:
             return False
 
         # 检查 LLM 服务是否就绪（auto_start 场景下可能还在启动中）
-        svc = get_service_manager()
-        if not svc.is_ready():
-            status = svc.get_status()
-            hotkey = self.config.get("plugin.hotkey", "Ctrl+Shift+C")
-            if status == "starting":
-                elapsed = svc.get_elapsed()
-                ResultPresenter.show_info(
-                    f"模型服务正在启动中（已等待 {elapsed} 秒），\n"
-                    f"vLLM 加载模型到显存需要 30~90 秒，\n"
-                    f"请稍后再按 {hotkey} 重试。"
-                )
-                return False
-            elif status == "failed":
-                ResultPresenter.show_error(
-                    f"模型服务启动失败：{svc.get_error()}\n"
-                    f"请检查 config.json 的 auto_start/model_path 配置，\n"
-                    f"或手动启动 vLLM 后重试。"
-                )
-                return False
+        if not self._ensure_service_ready():
+            return False
 
         try:
             with ProgressDialog("CHelper - 正在提取代码...") as progress:
@@ -110,18 +451,27 @@ class OptimizationHandler:
 
                 function_name = context.get('function_name', 'unknown')
                 address = context.get('address', '')
+                cache_metadata = {
+                    "function_name": context.get("function_name", ""),
+                    "function_type": context.get("function_type", ""),
+                    "types": context.get("types", ""),
+                }
                 self.logger.info(f"正在优化函数: {function_name} @ {address}")
                 ResultPresenter.print_to_output(f"正在优化函数: {function_name}")
 
                 # 2. 检查缓存
                 processed_code = None
+                result_metadata = {}
                 cache_hit = False
                 if self.cache and self.config.get("plugin.enable_cache", True) and not force_refresh:
                     progress.update("CHelper - 检查缓存...")
-                    cached = self.cache.get(address, pseudocode)
-                    if cached:
+                    cached = self.cache.get(address, pseudocode, cache_metadata)
+                    if self._is_usable_cached_result(pseudocode, cached):
                         processed_code = cached.get("optimized_code")
                         if processed_code:
+                            result_metadata = self._get_cached_result_metadata(
+                                pseudocode, cached
+                            )
                             cache_hit = True
                             self.logger.info(f"缓存命中: {function_name}")
                             ResultPresenter.print_to_output(f"缓存命中，跳过 LLM 调用")
@@ -130,7 +480,7 @@ class OptimizationHandler:
 
                 # 3. 调用LLM优化（未命中缓存时）
                 if not cache_hit:
-                    progress.update("CHelper - 正在调用本地大模型优化...")
+                    progress.update("CHelper - 正在调用大模型优化...")
 
                     # 检查是否可以取消
                     if progress.check_cancelled():
@@ -140,70 +490,54 @@ class OptimizationHandler:
                     optimized_code = self.llm_client.optimize_code(pseudocode, context)
 
                     if optimized_code is None:
-                        ResultPresenter.show_error("LLM优化失败，请检查配置和模型服务")
-                        self.logger.error("LLM优化失败")
-                        return False
+                        model_error = (
+                            self.llm_client.get_last_error()
+                            or "LLM优化失败，请检查配置和模型服务"
+                        )
+                        processed_code, success, result_metadata = (
+                            self._fallback_to_local_readability(
+                                pseudocode, model_error
+                            )
+                        )
+                        if not success:
+                            self._report_failure(model_error)
+                            return False
+                    else:
+                        # 4. 后处理
+                        progress.update("CHelper - 正在处理结果...")
 
-                    # 4. 后处理
-                    progress.update("CHelper - 正在处理结果...")
+                        # 再次检查取消
+                        if progress.check_cancelled():
+                            self.logger.info("用户取消优化")
+                            return False
 
-                    # 再次检查取消
-                    if progress.check_cancelled():
-                        self.logger.info("用户取消优化")
-                        return False
-
-                    processed_code, success, proc_error = CodeProcessor.process(
-                        optimized_code, pseudocode, self.config
-                    )
+                        processed_code, success, result_metadata = self._process_model_candidate(
+                            pseudocode, context, optimized_code
+                        )
 
                     if not success:
-                        warning_msg = f"代码处理: {proc_error}（仍会显示结果）"
-                        ResultPresenter.print_to_output(f"警告: {warning_msg}")
-                        self.logger.warning(warning_msg)
-                        processed_code = optimized_code
+                        error_msg = self._format_processing_failure(result_metadata)
+                        self._report_failure(error_msg)
+                        # Do not display or cache an output that failed the
+                        # structural checks. The original IDA code remains
+                        # available in the pseudocode view.
+                        return False
 
-            # 4. 计算统计
-            stats = CodeProcessor.calculate_diff_stats(pseudocode, processed_code)
+                    if not processed_code or not processed_code.strip():
+                        ResultPresenter.show_error("代码处理失败：结果为空")
+                        self.logger.error("代码处理失败：结果为空")
+                        return False
 
-            # 5. 保存到缓存（仅在非缓存命中时）
-            if not cache_hit and self.cache and self.config.get("plugin.enable_cache", True):
-                try:
-                    self.cache.set(address, pseudocode, processed_code, function_name, stats)
-                    self.logger.debug(f"已缓存优化结果: {function_name}")
-                except Exception as e:
-                    self.logger.warning(f"缓存保存失败: {e}")
-
-            # 6. 自动复制优化代码到剪贴板
-            try:
-                ida_kernwin.copy_to_clipboard(processed_code)
-                clipboard_msg = "已复制到剪贴板"
-            except Exception:
-                clipboard_msg = "复制到剪贴板失败"
-
-            # 7. 在新窗口显示优化后的代码（类似 F5 伪代码窗口）
-            show_diff = self.config.get("plugin.show_diff", True)
-            auto_apply = self.config.get("plugin.auto_apply", False)
-
-            ResultPresenter.show_optimized_window(processed_code, context, stats)
-
-            # 打印统计信息
-            cache_suffix = " (缓存)" if cache_hit else ""
-            result_msg = (
-                f"优化完成{cache_suffix}: {stats['original_lines']} -> {stats['optimized_lines']} 行, "
-                f"{stats['original_chars']} -> {stats['optimized_chars']} 字符, "
-                f"{clipboard_msg}"
+            return self._publish_result(
+                pseudocode,
+                processed_code,
+                context,
+                address,
+                function_name,
+                cache_metadata,
+                cache_hit,
+                result_metadata,
             )
-            ResultPresenter.print_to_output(result_msg)
-            self.logger.info(result_msg)
-
-            # auto_apply 模式下额外提示
-            if auto_apply:
-                ResultPresenter.show_info(
-                    f"优化完成，代码{clipboard_msg}。\n"
-                    f"您可以在 IDA 中手动重命名变量/函数、添加注释。"
-                )
-
-            return True
 
         except Exception as e:
             error_msg = f"执行过程中出错: {str(e)}"
@@ -211,25 +545,237 @@ class OptimizationHandler:
             self.logger.exception(error_msg)
             return False
 
-    def _apply_to_ida(self, code: str, cfunc) -> bool:
-        """将优化后的代码应用到IDA（当前仅复制到剪贴板）
+    def execute_async(self, force_refresh: bool = False) -> bool:
+        """Start optimization without blocking IDA's main/UI thread.
 
-        注意：直接修改IDA反编译结果是复杂操作，当前版本仅复制到剪贴板。
-        后续版本将通过 ida_name.set_name() 等接口直接重命名。
-
-        Args:
-            code: 优化后的代码
-            cfunc: cfunc对象
-
-        Returns:
-            成功返回True
+        Extraction and presentation stay on the IDA thread. Only the network
+        request and pure-Python post-processing run in the worker thread; the
+        completion callback is queued back through ``execute_ui_requests``.
         """
-        try:
-            ida_kernwin.copy_to_clipboard(code)
-            return True
-        except Exception as e:
-            ResultPresenter.show_error(f"应用代码失败: {str(e)}")
+        can_exec, error_msg = self.can_execute()
+        if not can_exec:
+            ResultPresenter.show_error(error_msg)
             return False
+
+        with self._busy_lock:
+            if self._busy:
+                self.logger.info("CHelper 已有任务在处理中，本次快捷键已忽略。")
+                return False
+            self._busy = True
+
+        started = False
+        try:
+            pseudocode, context, _cfunc = CodeExtractor.get_current_pseudocode()
+            if pseudocode is None or context is None:
+                ResultPresenter.show_error("提取伪C代码失败")
+                return False
+
+            max_size = self.config.get("plugin.max_function_size", 10000)
+            if not CodeExtractor.validate_pseudocode_size(pseudocode, max_size):
+                ResultPresenter.show_error(
+                    f"函数代码过大 ({len(pseudocode)} 字符)，超过限制 ({max_size} 字符)"
+                )
+                return False
+
+            function_name = context.get("function_name", "unknown")
+            address = context.get("address", "")
+            cache_metadata = {
+                "function_name": context.get("function_name", ""),
+                "function_type": context.get("function_type", ""),
+                "types": context.get("types", ""),
+            }
+
+            if self.cache and self.config.get("plugin.enable_cache", True) and not force_refresh:
+                cached = self.cache.get(address, pseudocode, cache_metadata)
+                if self._is_usable_cached_result(pseudocode, cached):
+                    result = self._publish_result(
+                        pseudocode,
+                        cached["optimized_code"],
+                        context,
+                        address,
+                        function_name,
+                        cache_metadata,
+                        cache_hit=True,
+                        result_metadata=self._get_cached_result_metadata(
+                            pseudocode, cached
+                        ),
+                    )
+                    return result
+
+            # Do not discard the user's first request while the background
+            # service loader is still warming up.  Cache hits above work even
+            # before the model is ready; uncached requests are queued below.
+            svc = get_service_manager()
+            service_ready = svc.is_ready()
+            if not service_ready and svc.get_status() == "idle":
+                service_ready = svc.check_now()
+            service_status = svc.get_status()
+            if not service_ready and service_status == "failed":
+                ResultPresenter.show_error(f"模型服务启动失败：{svc.get_error()}")
+                return False
+            if not service_ready and service_status == "disabled":
+                ResultPresenter.show_error(
+                    "模型服务未启动。请启动服务后重试，或在 config.json 中开启 auto_start。"
+                )
+                return False
+
+            ResultPresenter.print_to_output(f"正在优化函数: {function_name}")
+            if service_ready:
+                ida_kernwin.show_wait_box("CHelper - 正在调用大模型优化...")
+                target = self._async_worker
+            else:
+                elapsed = svc.get_elapsed()
+                ida_kernwin.show_wait_box("CHelper - 模型服务启动中，任务已排队...")
+                ResultPresenter.print_to_output(
+                    f"模型服务启动中（已等待 {elapsed} 秒），已排队并会在就绪后自动开始。"
+                )
+                target = self._wait_for_service_then_optimize
+            worker = threading.Thread(
+                target=target,
+                args=(pseudocode, context, address, function_name, cache_metadata),
+                daemon=True,
+            )
+            worker.start()
+            started = True
+            return True
+        except Exception as exc:
+            self._set_busy(False)
+            try:
+                ida_kernwin.hide_wait_box()
+            except Exception:
+                pass
+            ResultPresenter.show_error(f"启动异步优化失败: {exc}")
+            self.logger.exception(f"启动异步优化失败: {exc}")
+            return False
+        finally:
+            # The worker owns the busy state after it has been started.
+            if not started:
+                self._set_busy(False)
+
+    def _set_busy(self, value: bool):
+        with self._busy_lock:
+            self._busy = value
+
+    def _wait_for_service_then_optimize(
+        self, pseudocode, context, address, function_name, cache_metadata
+    ):
+        """Wait off the UI thread, then run the normal optimization worker."""
+        svc = get_service_manager()
+        try:
+            timeout = max(1, int(self.config.get("llm.startup_timeout", 180)))
+        except (TypeError, ValueError):
+            timeout = 180
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            if svc.is_ready() or svc.check_now():
+                self._async_worker(
+                    pseudocode, context, address, function_name, cache_metadata
+                )
+                return
+
+            status = svc.get_status()
+            if status == "failed":
+                self._queue_async_completion(
+                    pseudocode, context, address, function_name, cache_metadata,
+                    None, f"模型服务启动失败：{svc.get_error()}"
+                )
+                return
+            if status == "disabled":
+                self._queue_async_completion(
+                    pseudocode, context, address, function_name, cache_metadata,
+                    None, "模型服务未启动，请启动服务后重试。"
+                )
+                return
+            time.sleep(1.0)
+
+        self._queue_async_completion(
+            pseudocode, context, address, function_name, cache_metadata,
+            None, f"等待模型服务就绪超时（{timeout} 秒）"
+        )
+
+    def _async_worker(self, pseudocode, context, address, function_name, cache_metadata):
+        """Run network/post-processing work off the IDA UI thread."""
+        try:
+            optimized_code = self.llm_client.optimize_code(pseudocode, context)
+            if optimized_code is None:
+                model_error = (
+                    self.llm_client.get_last_error()
+                    or "LLM优化失败，请检查配置和模型服务"
+                )
+                processed_code, success, result_metadata = self._fallback_to_local_readability(
+                    pseudocode, model_error
+                )
+                if not success:
+                    self._queue_async_completion(
+                        pseudocode, context, address, function_name, cache_metadata,
+                        None, model_error
+                    )
+                    return
+            else:
+                processed_code, success, result_metadata = self._process_model_candidate(
+                    pseudocode, context, optimized_code
+                )
+            if not success:
+                error_msg = self._format_processing_failure(result_metadata)
+                self._queue_async_completion(
+                    pseudocode, context, address, function_name, cache_metadata,
+                    None, error_msg
+                )
+                return
+            if not processed_code or not processed_code.strip():
+                self._queue_async_completion(
+                    pseudocode, context, address, function_name, cache_metadata,
+                    None, "代码处理失败：结果为空"
+                )
+                return
+
+            self._queue_async_completion(
+                pseudocode, context, address, function_name, cache_metadata,
+                processed_code, "", result_metadata
+            )
+        except Exception as exc:
+            self._queue_async_completion(
+                pseudocode, context, address, function_name, cache_metadata,
+                None, f"异步优化失败: {exc}"
+            )
+
+    def _queue_async_completion(
+        self,
+        pseudocode,
+        context,
+        address,
+        function_name,
+        cache_metadata,
+        processed_code,
+        error_message,
+        result_metadata=None,
+    ):
+        def complete_on_ui():
+            try:
+                ida_kernwin.hide_wait_box()
+                if error_message:
+                    self._report_failure(error_message)
+                    return False
+                if not self._publish_result(
+                    pseudocode,
+                    processed_code,
+                    context,
+                    address,
+                    function_name,
+                    cache_metadata,
+                    result_metadata=result_metadata,
+                ):
+                    self.logger.error("显示异步优化结果失败")
+            finally:
+                self._set_busy(False)
+            return False
+
+        try:
+            ida_kernwin.execute_ui_requests([complete_on_ui])
+        except Exception as exc:
+            self.logger.exception(f"提交异步完成回调失败: {exc}")
+            self._set_busy(False)
 
 
 class HotkeyHandler(ida_kernwin.action_handler_t):
@@ -249,7 +795,7 @@ class HotkeyHandler(ida_kernwin.action_handler_t):
         Returns:
             1表示成功
         """
-        self.handler.execute(force_refresh=self.force_refresh)
+        self.handler.execute_async(force_refresh=self.force_refresh)
         return 1
 
     def update(self, ctx):

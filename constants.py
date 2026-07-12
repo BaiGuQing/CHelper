@@ -8,16 +8,13 @@
 # OLLVM 魔数除法检测阈值
 HEAVY_OBF_PATTERN_THRESHOLD = 2
 
-# OLLVM 魔数模式（十六进制长度）
-MAGIC_NUMBER_LENGTH = 16
-
 # ===== 退化检测 =====
 
 # 重复行触发截断的阈值
 DEGENERATION_THRESHOLD = 4
 
-# 代码片段判定阈值（相对原文长度比例）
-INCOMPLETE_FRAGMENT_RATIO = 0.3
+# 语义安全检查默认允许的最小输出长度比例
+DEFAULT_MINIMUM_OUTPUT_RATIO = 0.45
 
 # ===== LLM 参数默认值 =====
 
@@ -93,18 +90,17 @@ DEFAULT_MAX_FUNCTION_SIZE = 10000
 
 # 正则表达式：函数签名检测
 FUNCTION_SIGNATURE_PATTERN = (
-    r'^\s*(?:int|void|char|unsigned|_BYTE|_WORD|_DWORD|_QWORD|bool|float|double|'
-    r'long|short|size_t|__int64|__int32|__int16|__int8)'
-    r'(?:\s*\*)?\s+(?:__fastcall\s+)?[A-Za-z_]\w*\s*\('
+    r'^\s*(?:(?:const|volatile|static|inline|extern|unsigned|signed|long|short|'
+    r'struct|enum|union|class|__declspec\([^)]*\))\s+)*'
+    # The separator between return type and function name may be whitespace
+    # (`int foo`) or a pointer declarator (`char *__fastcall foo`).
+    r'[A-Za-z_]\w*(?:\s+\*+\s*|\s+|\s*\*+\s*)'
+    r'(?:(?:__cdecl|__stdcall|__fastcall|__thiscall|__vectorcall)\s*)?'
+    r'[A-Za-z_]\w*\s*\('
 )
 
 # 正则表达式：IDA 变量命名模式
 IDA_VAR_PATTERN = r'^[a-zA-Z]\d*$|^[a-z]+_\d+$'
-
-# ===== 推理模型 =====
-
-# 默认推理标签
-DEFAULT_REASONING_TAGS = ["think", "thinking"]
 
 # ===== 调试 =====
 
@@ -165,14 +161,3 @@ OLLVM_MAGIC_PATTERNS = [
 CONSERVATIVE_MODE_AUTO = "auto"
 CONSERVATIVE_MODE_ON = "on"
 CONSERVATIVE_MODE_OFF = "off"
-
-# ===== 流式输出 =====
-
-# SSE 数据前缀
-SSE_DATA_PREFIX = "data: "
-
-# SSE 结束标记
-SSE_DONE_MARKER = "[DONE]"
-
-# 流式缓冲区保留长度（用于不完整标签检测）
-STREAM_BUFFER_RESERVE_LENGTH = 10
