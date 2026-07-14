@@ -15,13 +15,16 @@ adding comments, all with a single hotkey.
 
 ## Features
 
-- **One-hotkey optimize** — `Ctrl+Alt+C` in the decompiler view sends the
-  current function to the LLM on a background worker thread and pops the result
-  up in a new viewer tab when ready. IDA's UI stays responsive.
+- **One-hotkey optimize** — `Ctrl+Alt+C` sends the current function through a
+  background pipeline. It calls the LLM only when needed and can finish locally
+  when deterministic rules are sufficient. The result opens in a new viewer tab
+  while IDA's UI stays responsive.
 - **Non-blocking async pipeline** — extraction and presentation run on the IDA
   thread; only the network request and pure-Python post-processing run off the
   UI thread. Requests issued while the backend is still warming up are queued
   and auto-start when the service becomes ready.
+- **Stale-task protection** — plugin unload invalidates unfinished background
+  work so an old task cannot publish a result after the plugin is gone.
 - **Local model backends** — bundled llama.cpp server, vLLM, Ollama, or any
   OpenAI-compatible endpoint (local or online).
 - **Reasoning-model aware** — automatically strips `<think>…</think>` blocks
@@ -33,8 +36,11 @@ adding comments, all with a single hotkey.
   branches, simplifies magic-number divisions. The deobfuscation instruction is
   only issued when a concrete OLLVM pattern is actually detected, avoiding
   hallucinated "simplifications" of ordinary code.
-- **Expression simplification & smart renaming** — collapses redundant
-  arithmetic and infers meaningful names from context.
+- **Small-model-friendly smart renaming** — conservative mode asks only for a
+  compact JSON rename map; the plugin applies it to the original pseudocode,
+  so the model never has to reproduce a complete function.
+- **Expression simplification** — full mode can simplify expressions and
+  restructure control flow.
 - **Three-tier result classification** — every result is labeled as
   `model_local_rename` (conservative), `model_full_rewrite`, or
   `local_readability_fallback`, and the label is shown in the viewer header.
@@ -49,12 +55,14 @@ adding comments, all with a single hotkey.
   automatically. `Ctrl+Alt+R` forces a cache bypass for a single function.
 - **Auto-start llama.cpp / vLLM** — the plugin can spawn the backend process
   for you on load, poll until the API is ready, and clean it up on unload.
-- **Safety quality gate** — rejects outputs that lose the function signature,
+  Backend output is written to `.debug/service.log` by default for diagnostics.
+- **Structural and semantic-anchor quality gate** — rejects outputs that lose the function signature,
   calls, string/numeric constants, or IDA global symbols; rejects unverified
   new calls/globals; rejects incomplete fragments, truncated outputs, and
   whitespace-only no-ops. Invalid outputs are never cached and never overwrite
-  the original pseudocode.
-- **Bounded quality repair** — when a complete model answer fails the semantic
+  the original pseudocode. Full-mode checks are heuristic safeguards, not a
+  formal proof of semantic equivalence.
+- **Bounded quality repair** — when a full-mode answer fails the anchor
   guard, CHelper runs one stricter repair attempt (using the original pseudocode
   as the only authority) before falling back.
 - **Local readability fallback** — if the model returns nothing usable, a
@@ -69,9 +77,6 @@ adding comments, all with a single hotkey.
   attached to the pseudocode widget popup via `UI_Hooks`.
 - **Config validation** — `config.json` is validated on load; friendly errors
   are shown in IDA's Output window and a warning dialog.
-- **Regression test suite** — pure-Python modules (cache, processor, llm_client,
-  presenter, service_manager, config_validator, handler) are covered by
-  `tests/` and can be run without IDA.
 - **IDA 9.0+ support.**
 
 ---
@@ -121,7 +126,6 @@ sit *directly* in the `plugins/` directory, so you need both:
         ├── llm_client.py
         ├── handler.py
         ├── …
-        ├── tests/          ← regression tests (not required at runtime)
         ├── .llama_bin/     ← (optional) llama.cpp binaries, see step 4
         └── <model>.gguf    ← (optional) model weights, see step 3
 ```
@@ -130,7 +134,7 @@ sit *directly* in the `plugins/` directory, so you need both:
 
 1. Copy `loader/CHelper.py` → `<IDA>/plugins/CHelper.py`
 2. Copy the rest of the repo (`__init__.py`, `CHelper.py`, `config.py`,
-   `config.json`, `*.py`, `requirements.txt`, `tests/`) →
+   `config.json`, `*.py`, `requirements.txt`) →
    `<IDA>/plugins/CHelper/`
 
 > **IDA plugins directory locations**
@@ -176,7 +180,7 @@ you can skip this step and adjust `config.json` (see below).
 On startup you should see in the Output window:
 
 ```
-[CHelper] v1.3.0 加载成功
+[CHelper] v1.4.0 加载成功
 [CHelper] 在反编译窗口按 Ctrl+Alt+C 优化代码
 [CHelper] 在反编译窗口按 Ctrl+Alt+R 强制刷新（忽略缓存）
 [CHelper] LLM API: http://127.0.0.1:8000/v1/chat/completions
@@ -196,8 +200,8 @@ available.
 2. Press `F5` to decompile a function with Hex-Rays.
 3. **In the pseudocode window, press `Ctrl+Alt+C`**
    (or right-click → *CHelper → 优化伪C代码*).
-4. Wait a few seconds for the LLM to process. A wait box shows progress and
-   you can cancel with the IDA cancel button.
+4. Wait while the LLM processes in the background. Progress messages appear in
+   IDA's Output window and the UI remains responsive.
 5. The optimized code opens in a new viewer tab
    (`CHelper - <function> @ <addr>`) with a header labeling the result kind,
    function name, address, line-count diff, and the number of renamed locals.
@@ -218,7 +222,7 @@ available.
 
 | Label in viewer | Meaning |
 |-----------------|---------|
-| `CHelper 模型保守美化` | Model rewrote only local identifiers + added comments (conservative mode) |
+| `CHelper 模型辅助命名` | Model returned a JSON rename map that the plugin safely applied to the original code |
 | `CHelper 模型全量重写` | Model rewrote expressions / control flow / locals (full mode) |
 | `CHelper 本地安全美化` | Model output was unusable; a deterministic local rename pass was applied instead |
 
@@ -252,6 +256,7 @@ Edit `config.json` in the plugin directory. Key fields:
     "strip_reasoning": true,          // strip <think>…</think> from reasoning models
     "reasoning_tags": ["think", "thinking"],
     "reasoning": "off",               // llama.cpp: prioritize code over thinking tokens
+    "reasoning_effort": null,          // Ollama/OpenAI: use "none" to disable thinking
     "reasoning_budget": 0,            // end <think> immediately when supported
 
     "auto_start": true,               // spawn llama-server / vllm on load
@@ -274,10 +279,11 @@ Edit `config.json` in the plugin directory. Key fields:
     "seed": null,                     // integer for reproducible sampling
 
     // robustness / safety
-    "conservative_mode": "off",       // "off" | "on" | "auto"
+    "conservative_mode": "on",        // "off" | "on" | "auto"
+    "conservative_model_renames": true,// allow JSON naming suggestions
     "degeneration_guard": true,       // truncate repeated-line degeneration
     "quality_guard": true,            // reject outputs missing semantic anchors
-    "minimum_output_ratio": 0.30,     // reject outputs shorter than this ratio
+    "minimum_output_ratio": 0.45,     // reject outputs shorter than this ratio
     "restore_unused_parameter_signature": true,
     "local_readability_fallback": true,  // deterministic rename fallback
     "quality_repair_attempts": 1,     // bounded strict retry after a rejection
@@ -291,10 +297,21 @@ Edit `config.json` in the plugin directory. Key fields:
 - `"off"` — allow full rewrites, redundant-code removal, and control-flow
   changes; the quality gate still checks the signature, completeness, output
   size, and new calls/globals.
-- `"on"` *(recommended for decompiler output)* — only rename local variables
-  and add comments, never touch logic.
+- `"on"` *(recommended for decompiler output)* — the model returns only a JSON
+  map for selected placeholder locals. The plugin performs token-level
+  replacement on the original source, so the model cannot change signatures,
+  expressions, control flow, calls, or constants. Suitable for 1–3B models.
 - `"auto"` — use conservative mode only for detected hard cases (OLLVM magic
   division, etc.); pair it with a 7B+ code model.
+
+> The full-mode gate checks structure and high-signal semantic anchors. It
+> cannot prove that conditions, boundaries, call ordering, or side effects are
+> equivalent, so always compare a full rewrite with the original pseudocode.
+
+Set `"conservative_model_renames": false` to skip the model entirely in
+conservative mode and use only deterministic local naming rules. Conservative
+mode does not generate model comments; `optimization.add_comments` applies to
+full mode only.
 
 To disable semantic-anchor checks entirely in full mode, also set
 `"quality_guard": false`. This accepts outputs that may remove original calls,
@@ -313,12 +330,13 @@ globals, or constants and should only be used with a trusted model.
     "enable_cache": true,
     "cache_dir": ".cache",
     "cache_max_age_days": 30,
-    "cache_cleanup_on_start": true
+    "cache_cleanup_on_start": true,
+    "service_log_file": ""          // empty uses .debug/service.log
   }
 }
 ```
 
-### `optimization` — what the LLM should do
+### `optimization` — what the LLM should do in full mode
 
 ```jsonc
 {
@@ -402,14 +420,6 @@ do not commit it to the repository.
 CHelper/                     ← repo root = plugin package
 ├── loader/
 │   └── CHelper.py           ← bootstrap loader (copy to plugins/CHelper.py)
-├── tests/                   ← regression tests (run without IDA)
-│   ├── __init__.py
-│   ├── test_config_validator.py
-│   ├── test_handler_quality_repair.py
-│   ├── test_llm_client.py
-│   ├── test_presenter.py
-│   ├── test_processor.py
-│   └── test_service_manager.py
 ├── __init__.py              ← package init, lazy PLUGIN_ENTRY
 ├── CHelper.py               ← main plugin class (IDA plugin_t) + popup hooks
 ├── handler.py               ← async optimization orchestration & quality repair
@@ -418,7 +428,7 @@ CHelper/                     ← repo root = plugin package
 ├── processor.py             ← post-processing, tokenizer, semantic anchor guard
 ├── presenter.py             ← custom viewer with C syntax highlight & dbl-click
 ├── service_manager.py       ← auto-start llama-server / vllm subprocess
-├── cache.py                 ← namespaced disk cache (schema v3)
+├── cache.py                 ← namespaced disk cache (schema v4)
 ├── config.py                ← config loader with defaults
 ├── config_validator.py      ← startup config validation
 ├── constants.py             ← shared constants & regex patterns
@@ -430,18 +440,6 @@ CHelper/                     ← repo root = plugin package
 ├── README.md                ← (this file)
 └── README.zh-CN.md
 ```
-
-### Running the tests
-
-The pure-Python modules can be tested without IDA. From the repo root:
-
-```bash
-python -m unittest discover -s tests -v
-# or, if pytest is available:
-pytest tests/
-```
-
----
 
 ## Troubleshooting
 
@@ -466,13 +464,15 @@ pytest tests/
 - For llama.cpp, also set `llm.reasoning: "off"` and `reasoning_budget: 0`.
 
 **Optimization quality is poor**
-- 1–3B reasoning models are not reliable for semantic decompiler rewrites; use a
-  code-focused 7B+ Instruct model such as `qwen2.5-coder:7b`.
+- Conservative mode is designed for small models: it requests only a short JSON
+  rename map and never asks the model to reproduce the function. Keep
+  `conservative_mode: "on"` for 1–3B models.
+- Use `conservative_mode: "off"` only when expression/control-flow rewriting is
+  required; that task benefits from a code-focused 7B+ Instruct model such as
+  `qwen2.5-coder:7b`.
 - Keep `llm.reasoning: "off"`, `temperature: 0.0`,
-  `conservative_mode: "on"`, and `quality_guard: true`. A rejected complete
-  answer gets one stricter repair attempt; unsafe output never overwrites or
-  caches the original pseudocode.
-- If the model returns the source unchanged or fails validation, CHelper can
+  and `conservative_mode: "on"`; malformed JSON and unsafe names are ignored.
+- If the model returns no usable suggestions, CHelper can
   apply a clearly labelled local-only readability pass. It only renames
   high-confidence local variables and re-runs syntax and semantic checks.
 - Use `Ctrl+Alt+R` to force a refresh, or restart IDA, so new service options

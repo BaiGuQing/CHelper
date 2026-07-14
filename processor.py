@@ -379,15 +379,150 @@ class CodeProcessor:
 
         return mapping
 
+    @staticmethod
+    def _looks_like_generated_local(name: str) -> bool:
+        """Return whether a local still looks like an IDA-generated placeholder."""
+        return bool(re.fullmatch(
+            r"(?:v\d+|[ijkn]|Str\d*|Buf\d*|Buffer\d*|Dst\d*|Src\d*)",
+            name or "",
+            re.IGNORECASE,
+        ))
+
+    @classmethod
+    def get_conservative_rename_candidates(
+        cls, code: str, excluded=None
+    ) -> list:
+        """List unresolved placeholder locals that a small model may name.
+
+        Deterministic evidence-based names are excluded because the plugin can
+        already apply them without spending model tokens. Meaningful user/IDA
+        names are also excluded so a weak model cannot gratuitously rename
+        them.
+        """
+        excluded = set(excluded or ())
+        declarations = cls._get_top_level_local_declarations(code)
+        tokens = cls._tokenize_c_code(code)
+        unsafe_names = {
+            token[1]
+            for index, token in enumerate(tokens)
+            if token[0] == "identifier"
+            and token[1] in declarations
+            and cls._identifier_has_unsafe_context(tokens, index)
+        }
+        return [
+            name
+            for name in declarations
+            if name not in excluded
+            and name not in unsafe_names
+            and cls._looks_like_generated_local(name)
+        ]
+
+    @classmethod
+    def apply_conservative_rename_plan(
+        cls, code: str, proposed_mapping=None, allowed_model_sources=None
+    ) -> tuple:
+        """Safely merge deterministic names with a model's rename suggestions.
+
+        Invalid suggestions are ignored individually. The accepted mapping is
+        then applied to the original pseudocode by token position and verified
+        with the same rename-only invariant used by the conservative guard.
+        """
+        deterministic = cls.build_safe_local_rename_mapping(code)
+        declarations = cls._get_top_level_local_declarations(code)
+        candidates = set(cls.get_conservative_rename_candidates(
+            code, excluded=deterministic
+        ))
+        if allowed_model_sources is not None:
+            candidates.intersection_update(allowed_model_sources)
+        identifiers = {
+            token[1] for token in cls._tokenize_c_code(code)
+            if token[0] == "identifier"
+        }
+        accepted_model = {}
+        rejected = {}
+        used_targets = set(deterministic.values())
+
+        if not isinstance(proposed_mapping, dict):
+            proposed_mapping = {}
+
+        for source_name, target_name in proposed_mapping.items():
+            if not isinstance(source_name, str) or not isinstance(target_name, str):
+                continue
+            source_name = source_name.strip()
+            target_name = target_name.strip()
+            reason = ""
+            if source_name not in declarations or source_name not in candidates:
+                reason = "不在允许重命名的占位局部变量列表中"
+            elif not re.fullmatch(r"[A-Za-z_]\w*", target_name):
+                reason = "新名称不是合法 C 标识符"
+            elif not re.fullmatch(r"[a-z_][a-z0-9_]*", target_name):
+                reason = "新名称必须使用小写 snake_case"
+            elif len(target_name) > 64:
+                reason = "新名称过长"
+            elif target_name.startswith((
+                "g_", "sub_", "loc_", "off_", "byte_", "word_",
+                "dword_", "qword_",
+            )):
+                reason = "新名称看起来像 IDA 全局符号"
+            elif target_name in cls._RESERVED_IDENTIFIERS:
+                reason = "新名称是保留字"
+            elif target_name == source_name:
+                reason = "名称没有变化"
+            elif target_name in identifiers or target_name in used_targets:
+                reason = "新名称与现有标识符冲突"
+            if reason:
+                rejected[source_name] = reason
+                continue
+            accepted_model[source_name] = target_name
+            used_targets.add(target_name)
+
+        combined = dict(accepted_model)
+        # Deterministic, syntax-derived evidence always wins over model advice.
+        combined.update(deterministic)
+        if not combined:
+            return code, {
+                "rename_mapping": {},
+                "deterministic_mapping": {},
+                "model_mapping": {},
+                "rejected_model_mapping": rejected,
+                "renamed_locals": 0,
+            }
+
+        candidate = cls._replace_identifier_tokens(code, combined)
+        valid, reason, confirmed = cls.validate_local_rename_only(code, candidate)
+        if not valid:
+            return code, {
+                "rename_mapping": {},
+                "deterministic_mapping": deterministic,
+                "model_mapping": {},
+                "rejected_model_mapping": {"__plan__": reason},
+                "renamed_locals": 0,
+            }
+
+        confirmed_model = {
+            source: target for source, target in accepted_model.items()
+            if confirmed.get(source) == target
+        }
+        confirmed_deterministic = {
+            source: target for source, target in deterministic.items()
+            if confirmed.get(source) == target
+        }
+        return candidate, {
+            "rename_mapping": confirmed,
+            "deterministic_mapping": confirmed_deterministic,
+            "model_mapping": confirmed_model,
+            "rejected_model_mapping": rejected,
+            "renamed_locals": len(confirmed),
+            "model_renamed_locals": len(confirmed_model),
+            "deterministic_renamed_locals": len(confirmed_deterministic),
+        }
+
     @classmethod
     def apply_safe_local_readability(cls, code: str) -> tuple:
         """Apply only verified local identifier substitutions to pseudocode."""
-        mapping = cls.build_safe_local_rename_mapping(code)
-        if not mapping:
-            return code, {}
-        candidate = cls._replace_identifier_tokens(code, mapping)
-        valid, _reason, confirmed_mapping = cls.validate_local_rename_only(code, candidate)
-        if not valid or not confirmed_mapping:
+        candidate, plan_metadata = cls.apply_conservative_rename_plan(code, {})
+        confirmed_mapping = plan_metadata.get("rename_mapping", {})
+        if not confirmed_mapping:
             return code, {}
         return candidate, {
             "result_kind": "local_readability",
@@ -810,13 +945,14 @@ class CodeProcessor:
         candidate: str,
         minimum_output_ratio: float = DEFAULT_MINIMUM_OUTPUT_RATIO,
         strict_anchors: bool = True,
+        profile: str = None,
     ) -> tuple:
         """Check structural and, optionally, semantic preservation.
 
-        Strict mode requires all high-signal anchors from the source.  Full
-        rewrite mode may remove redundant source calls/constants, but still
-        requires a complete function with the original signature, a reasonable
-        output size, and no unverified new function calls.
+        Profiles:
+        - strict: preserve calls, strings, numbers, and IDA globals.
+        - balanced: preserve calls, strings, and IDA globals; numbers may change.
+        - globals_only: preserve only the exact IDA-global symbol set.
         """
         if not original:
             return True, ""
@@ -831,27 +967,35 @@ class CodeProcessor:
         if original_signature and original_signature != candidate_signature:
             return False, "函数签名或参数类型被改写"
 
-        if strict_anchors:
-            anchors = (
+        if profile is None:
+            profile = "strict" if strict_anchors else "balanced"
+        profile = str(profile or "balanced").lower()
+        if profile not in ("strict", "balanced", "globals_only"):
+            profile = "balanced"
+
+        anchors = [("IDA 全局符号", CodeProcessor._extract_ida_global_symbols)]
+        if profile in ("strict", "balanced"):
+            anchors[0:0] = [
                 ("关键调用", CodeProcessor._extract_function_calls),
                 ("字符串常量", lambda text: set(CodeProcessor._STRING_LITERAL_PATTERN.findall(text))),
-                ("数值常量", CodeProcessor._extract_numeric_literals),
-                ("IDA 全局符号", CodeProcessor._extract_ida_global_symbols),
-            )
-            for label, extractor in anchors:
-                expected = extractor(original_function)
-                actual = extractor(candidate_function)
-                missing = expected - actual
-                if missing:
-                    examples = ", ".join(sorted(map(str, missing))[:4])
-                    return False, f"{label}丢失: {examples}"
+            ]
+        if profile == "strict":
+            anchors.append(("数值常量", CodeProcessor._extract_numeric_literals))
+        for label, extractor in anchors:
+            expected = extractor(original_function)
+            actual = extractor(candidate_function)
+            missing = expected - actual
+            if missing:
+                examples = ", ".join(sorted(map(str, missing))[:4])
+                return False, f"{label}丢失: {examples}"
 
-        original_calls = CodeProcessor._extract_function_calls(original_function)
-        candidate_calls = CodeProcessor._extract_function_calls(candidate_function)
-        unexpected_calls = candidate_calls - original_calls
-        if unexpected_calls:
-            examples = ", ".join(sorted(unexpected_calls)[:4])
-            return False, f"引入未验证调用: {examples}"
+        if profile != "globals_only":
+            original_calls = CodeProcessor._extract_function_calls(original_function)
+            candidate_calls = CodeProcessor._extract_function_calls(candidate_function)
+            unexpected_calls = candidate_calls - original_calls
+            if unexpected_calls:
+                examples = ", ".join(sorted(unexpected_calls)[:4])
+                return False, f"引入未验证调用: {examples}"
 
         original_globals = CodeProcessor._extract_ida_global_symbols(original_function)
         candidate_globals = CodeProcessor._extract_ida_global_symbols(candidate_function)
@@ -890,7 +1034,7 @@ class CodeProcessor:
         return reason.rstrip("。")
 
     @staticmethod
-    def get_required_semantic_anchors(original: str) -> str:
+    def get_required_semantic_anchors(original: str, profile: str = "balanced") -> str:
         """Summarize the minimum invariants for a model repair request.
 
         This is deliberately a readable checklist rather than a substitute for
@@ -906,12 +1050,19 @@ class CodeProcessor:
         if signature:
             entries.append(f"函数签名: {signature}")
 
-        for label, values in (
-            ("外部调用", CodeProcessor._extract_function_calls(source)),
+        profile = str(profile or "balanced").lower()
+        anchor_groups = [
             ("IDA 全局符号", CodeProcessor._extract_ida_global_symbols(source)),
-            ("字符串常量", set(CodeProcessor._STRING_LITERAL_PATTERN.findall(source))),
-            ("数值常量", CodeProcessor._extract_numeric_literals(source)),
-        ):
+        ]
+        if profile in ("strict", "balanced"):
+            anchor_groups[0:0] = [
+                ("外部调用", CodeProcessor._extract_function_calls(source)),
+                ("字符串常量", set(CodeProcessor._STRING_LITERAL_PATTERN.findall(source))),
+            ]
+        if profile == "strict":
+            anchor_groups.append(("数值常量", CodeProcessor._extract_numeric_literals(source)))
+
+        for label, values in anchor_groups:
             if values:
                 rendered = ", ".join(sorted(map(str, values))[:16])
                 entries.append(f"{label}: {rendered}")
@@ -1104,12 +1255,40 @@ class CodeProcessor:
             return code, False
 
         lines = code.split('\n')
-        if len(lines) < threshold * 2:
+        if len(lines) < threshold:
             return code, False
 
         def skeleton(line: str) -> str:
+            # Braces and declaration-only runs are common in valid generated C.
+            # Treating four nested closing braces or four adjacent ``int vN;``
+            # declarations as degeneration truncates an otherwise complete
+            # function and manufactures a later syntax error.
+            semantic_line = re.sub(r'//.*$', '', line).strip()
+            if not semantic_line:
+                return ""
+            if re.fullmatch(r'[{}]+;?', semantic_line):
+                return ""
+            if re.fullmatch(r'(?:else|do)(?:\s*\{)?', semantic_line, re.IGNORECASE):
+                return ""
+            declaration_only = re.fullmatch(
+                r'(?:[A-Za-z_]\w*\s+)+'
+                r'(?:\*+\s*)?[A-Za-z_]\w*'
+                r'(?:\s*\[[^\]]*\])?\s*;',
+                semantic_line,
+            )
+            if declaration_only:
+                return ""
+            simple_constant_assignment = re.fullmatch(
+                r'[A-Za-z_]\w*\s*=\s*'
+                r'(?:[-+]?(?:0[xX][0-9A-Fa-f]+|\d+)[uUlL]*|'
+                r'nullptr|NULL|true|false)\s*;',
+                semantic_line,
+            )
+            if simple_constant_assignment:
+                return ""
+
             # 去掉变量编号数字（v123 -> v），压缩空白，转小写
-            s = re.sub(r'\b[vV]\d+\b', 'v', line)
+            s = re.sub(r'\b[vV]\d+\b', 'v', semantic_line)
             s = re.sub(r'\b[a-zA-Z_]+\d+\b', 'x', s)  # 任意标识符带数字也归一
             s = re.sub(r'\d+', '0', s)
             s = re.sub(r'\s+', ' ', s).strip().lower()
@@ -1197,6 +1376,20 @@ class CodeProcessor:
         code = CodeProcessor.clean_llm_artifacts(code)
         logger.debug("已清理 LLM 生成的非代码内容")
 
+        # ``quality_guard`` is the master switch. When disabled, do not run
+        # signature restoration, degeneration detection, complete-function
+        # checks, delimiter checks, anchor checks, repair-triggering rejection,
+        # or annotation injection. The model candidate is intentionally shown
+        # as-is after only envelope/artifact cleanup.
+        quality_guard = True
+        if config is not None:
+            quality_guard = config.get("llm.quality_guard", True)
+        if not quality_guard:
+            if not code or not code.strip():
+                return "", False, "模型输出为空"
+            logger.info("质量检测已关闭，直接采用模型候选")
+            return CodeProcessor.remove_extra_whitespace(code), True, ""
+
         # Recover the authoritative IDA signature for a narrowly safe case:
         # a model changed only ABI/type spelling while the same parameters are
         # completely unused by its body.  This avoids rejecting harmless
@@ -1241,24 +1434,21 @@ class CodeProcessor:
         # quality guard compares high-signal anchors before it is shown or
         # cached.  Users who deliberately want aggressive transformations can
         # opt out through llm.quality_guard.
-        quality_guard = True
-        minimum_output_ratio = DEFAULT_MINIMUM_OUTPUT_RATIO
-        strict_anchors = True
+        quality_profile = "balanced"
         if config is not None:
-            quality_guard = config.get("llm.quality_guard", True)
-            minimum_output_ratio = config.get(
-                "llm.minimum_output_ratio", DEFAULT_MINIMUM_OUTPUT_RATIO
-            )
-            # ``off`` is the deliberate full-rewrite profile. Keep structural
-            # checks enabled while allowing the user to remove redundant source
-            # anchors such as dead calls, strings, and constants.
-            conservative_mode = str(
-                config.get("llm.conservative_mode", "auto") or "auto"
+            quality_profile = str(
+                config.get("llm.quality_guard_profile", "balanced")
+                or "balanced"
             ).lower()
-            strict_anchors = conservative_mode != "off"
-        if original and quality_guard:
+        default_ratio = 0.1 if quality_profile == "globals_only" else DEFAULT_MINIMUM_OUTPUT_RATIO
+        minimum_output_ratio = default_ratio
+        if config is not None:
+            minimum_output_ratio = config.get(
+                "llm.minimum_output_ratio", default_ratio
+            )
+        if original:
             preserved, preservation_error = CodeProcessor.validate_semantic_preservation(
-                original, code, minimum_output_ratio, strict_anchors=strict_anchors
+                original, code, minimum_output_ratio, profile=quality_profile
             )
             if not preserved:
                 msg = (

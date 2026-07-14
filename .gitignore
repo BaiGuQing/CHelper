@@ -12,6 +12,9 @@ __pycache__/
 *.log
 
 # ===== Large binaries (not tracked in git) =====
+# Local model directory (weights, tokenizer and converted artifacts)
+models/
+
 # Model weights
 *.gguf
 *.gguf.tmp
@@ -24,6 +27,12 @@ VibeThinker-3B/
 
 # vLLM / Ollama local model dirs
 *.vllm/
+
+# ===== Development-only files (not required by the IDA plugin) =====
+tests/
+training/
+download_model.py
+download_model.ps1
 
 # ===== IDE / editor =====
 .vscode/

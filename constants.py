@@ -11,12 +11,18 @@ HEAVY_OBF_PATTERN_THRESHOLD = 2
 # ===== 退化检测 =====
 
 # 重复行触发截断的阈值
-DEGENERATION_THRESHOLD = 4
+# Model degeneration normally produces long runs (often dozens/hundreds of
+# template-identical lines). Four is common in legitimate initialization
+# blocks, so require a longer run before rejecting generated code.
+DEGENERATION_THRESHOLD = 8
 
 # 语义安全检查默认允许的最小输出长度比例
 DEFAULT_MINIMUM_OUTPUT_RATIO = 0.45
 
 # ===== LLM 参数默认值 =====
+
+# Prompt/protocol version used to namespace disk cache entries.
+PROMPT_VERSION = "structured-renames-v9"
 
 # 默认温度
 DEFAULT_TEMPERATURE = 0.3

@@ -57,6 +57,10 @@ class LLMServiceManager:
         self._process = None
         self._start_time = 0
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._service_log = None
+        self._service_log_path = ""
 
         # 推断插件目录（用于默认 model_path）
         self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -129,6 +133,19 @@ class LLMServiceManager:
         except Exception:
             return "localhost", 8000
 
+    @staticmethod
+    def _models_url_from_api_url(api_url: str) -> str:
+        """Build the health endpoint without discarding a reverse-proxy prefix."""
+        parsed = urlparse(str(api_url or "").strip())
+        path = (parsed.path or "").rstrip("/")
+        suffix = "/chat/completions"
+        if path.endswith(suffix):
+            path = path[:-len(suffix)]
+        elif not path.endswith("/v1"):
+            path = f"{path}/v1" if path else "/v1"
+        models_path = f"{path}/models"
+        return parsed._replace(path=models_path, params="", query="", fragment="").geturl()
+
     def _is_port_open(self, host: str, port: int, timeout: float = 2.0) -> bool:
         """检测端口是否可连接
 
@@ -158,9 +175,7 @@ class LLMServiceManager:
             API 就绪返回True
         """
         try:
-            parsed = urlparse(self.api_url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
-            models_url = f"{base_url}/v1/models"
+            models_url = self._models_url_from_api_url(self.api_url)
 
             headers = {}
             api_key = self.config.get("llm.api_key", "")
@@ -272,17 +287,37 @@ class LLMServiceManager:
             bin_label = "vLLM"
 
         try:
+            if self._stop_event.is_set():
+                return False
             # Windows 下隐藏控制台窗口，不阻塞 IDA
             creationflags = 0
             if sys.platform == "win32":
                 creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
 
+            service_log_path = self.config.get("plugin.service_log_file", "")
+            if not service_log_path:
+                service_log_path = os.path.join(
+                    self._plugin_dir, ".debug", "service.log"
+                )
+            elif not os.path.isabs(service_log_path):
+                service_log_path = os.path.join(self._plugin_dir, service_log_path)
+            os.makedirs(os.path.dirname(service_log_path), exist_ok=True)
+            self._service_log_path = service_log_path
+            self._service_log = open(service_log_path, "a", encoding="utf-8")
+            self._service_log.write(
+                f"\n--- CHelper service start: {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+                f"{' '.join(cmd)}\n"
+            )
+            self._service_log.flush()
             self._process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=self._service_log,
+                stderr=subprocess.STDOUT,
                 creationflags=creationflags,
             )
+            if self._stop_event.is_set():
+                self.stop()
+                return False
             self._print(f"{bin_label} 进程已启动 (PID: {self._process.pid})")
             self._print(f"命令: {' '.join(cmd)}")
             return True
@@ -291,9 +326,16 @@ class LLMServiceManager:
                 f"找不到可执行文件 '{cmd[0]}'，"
                 f"请检查 config.json 的 llm.backend / vllm_binary / llama_server_binary 配置"
             )
+            self._close_service_log()
             return False
         except Exception as e:
             self._error = f"启动 {bin_label} 失败: {e}"
+            if self._service_log is not None:
+                try:
+                    self._service_log.close()
+                except Exception:
+                    pass
+                self._service_log = None
             return False
 
     def _print(self, msg: str):
@@ -301,14 +343,30 @@ class LLMServiceManager:
         self.logger.info(msg)
 
     def stop(self):
-        """Stop a process started by this manager, if any."""
+        """Stop the manager thread and any process started by this manager."""
+        self._stop_event.set()
         with self._lock:
             process = self._process
             self._process = None
+            thread = self._thread
+            self._thread = None
+            if self._status not in ("disabled", "failed"):
+                self._status = "stopped"
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
         if process is None or process.poll() is not None:
+            self._close_service_log()
             return
         try:
-            process.terminate()
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                process.terminate()
             process.wait(timeout=5)
         except Exception:
             try:
@@ -316,9 +374,21 @@ class LLMServiceManager:
                 process.wait(timeout=2)
             except Exception:
                 pass
+        self._close_service_log()
+
+    def _close_service_log(self):
+        log = self._service_log
+        self._service_log = None
+        if log is not None:
+            try:
+                log.close()
+            except Exception:
+                pass
 
     def _run_async(self):
         """后台线程主逻辑：检测 -> 启动 -> 轮询就绪"""
+        if self._stop_event.is_set():
+            return
         with self._lock:
             if self._status in ("ready", "starting"):
                 return
@@ -330,6 +400,8 @@ class LLMServiceManager:
         # 1. 先检测 API 是否已经可达
         self._print("正在检测模型服务状态...")
         if self._is_api_ready():
+            if self._stop_event.is_set():
+                return
             self._print("模型服务已在运行，无需启动")
             with self._lock:
                 self._status = "ready"
@@ -337,6 +409,8 @@ class LLMServiceManager:
 
         # 2. 若未开启 auto_start，标记为 disabled（让 handler 提示用户手动启动）
         if not self.auto_start:
+            if self._stop_event.is_set():
+                return
             self._print(f"模型服务未运行，auto_start 未开启，请手动启动 {self.backend}")
             with self._lock:
                 self._status = "disabled"
@@ -345,6 +419,8 @@ class LLMServiceManager:
         # 3. 解析模型路径
         model_path = self._resolve_model_path()
         if not model_path:
+            if self._stop_event.is_set():
+                return
             self._error = (
                 f"未找到模型权重。请在 config.json 的 llm.model_path 填写路径"
                 f"（vLLM 用 safetensors 目录，llama.cpp 用 .gguf 文件），"
@@ -367,6 +443,9 @@ class LLMServiceManager:
         # 5. 轮询直到 API 就绪或超时
         poll_interval = SERVICE_POLL_INTERVAL
         while True:
+            if self._stop_event.is_set():
+                self.stop()
+                return
             elapsed = time.time() - self._start_time
             if elapsed > self.startup_timeout:
                 self._error = (
@@ -381,8 +460,11 @@ class LLMServiceManager:
 
             # 检查进程是否已退出（启动失败）
             if self._process and self._process.poll() is not None:
+                return_code = self._process.returncode
+                self._process = None
+                self._close_service_log()
                 self._error = (
-                    f"{bin_label} 进程已退出（code={self._process.returncode}），"
+                    f"{bin_label} 进程已退出（code={return_code}），"
                     f"可能是显存不足或参数错误。建议手动运行查看错误信息"
                 )
                 self._print(self._error)
@@ -397,7 +479,7 @@ class LLMServiceManager:
                     self._status = "ready"
                 return
 
-            time.sleep(poll_interval)
+            self._stop_event.wait(poll_interval)
 
     # ===== 公开接口 =====
 
@@ -417,7 +499,16 @@ class LLMServiceManager:
             self._print("OpenAI 兼容在线模型模式已启用，跳过本地服务管理")
             return
 
-        thread = threading.Thread(target=self._run_async, daemon=True)
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            thread = threading.Thread(
+                target=self._run_async,
+                name="CHelper-ServiceManager",
+                daemon=True,
+            )
+            self._thread = thread
         thread.start()
 
     def is_ready(self) -> bool:
@@ -429,7 +520,7 @@ class LLMServiceManager:
         """获取当前状态
 
         Returns:
-            "idle" / "starting" / "ready" / "failed" / "disabled"
+            "idle" / "starting" / "ready" / "failed" / "disabled" / "stopped"
         """
         with self._lock:
             return self._status
@@ -490,3 +581,12 @@ def get_service_manager() -> LLMServiceManager:
         from .config import get_config
         _global_service_manager = LLMServiceManager(get_config())
     return _global_service_manager
+
+
+def shutdown_service_manager():
+    """Stop and release the global manager so a later load uses new config."""
+    global _global_service_manager
+    manager = _global_service_manager
+    _global_service_manager = None
+    if manager is not None:
+        manager.stop()

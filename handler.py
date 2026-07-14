@@ -28,6 +28,8 @@ class OptimizationHandler:
         self.cache = get_cache()
         self._busy_lock = threading.Lock()
         self._busy = False
+        self._cancel_event = threading.Event()
+        self._generation = 0
 
     def _ensure_service_ready(self) -> bool:
         """Check service state and show a useful message when it is unavailable."""
@@ -138,7 +140,7 @@ class OptimizationHandler:
 
         if model_reason:
             if model_reason == "自动修复未产生实质改动":
-                reason_text = f"自动保守修复未产生可应用改动（{model_reason}）"
+                reason_text = f"自动修复未产生可应用改动（{model_reason}）"
             else:
                 reason_text = f"未采用模型输出（{model_reason}）"
             self.logger.warning(
@@ -164,22 +166,96 @@ class OptimizationHandler:
         mode = str(self.config.get("llm.conservative_mode", "on") or "on").lower()
         return mode != "off"
 
+    def _requires_model_service(self, pseudocode: str) -> bool:
+        """Return False when conservative deterministic naming is sufficient."""
+        if not self._is_conservative_mode(pseudocode):
+            return True
+        if not self.config.get("llm.conservative_model_renames", True):
+            return False
+        deterministic = CodeProcessor.build_safe_local_rename_mapping(pseudocode)
+        return bool(CodeProcessor.get_conservative_rename_candidates(
+            pseudocode, excluded=deterministic
+        )[:24])
+
+    def _process_conservative_rename_plan(
+        self, pseudocode: str, context: dict, cancel_event=None
+    ) -> tuple:
+        """Apply a small-model rename plan without letting it regenerate C."""
+        deterministic = CodeProcessor.build_safe_local_rename_mapping(pseudocode)
+        candidates = CodeProcessor.get_conservative_rename_candidates(
+            pseudocode, excluded=deterministic
+        )[:24]
+        proposed = {}
+        model_error = ""
+        use_model = self.config.get("llm.conservative_model_renames", True)
+
+        if candidates and use_model:
+            proposed = self.llm_client.suggest_conservative_renames(
+                pseudocode,
+                context,
+                candidates,
+                cancel_event=cancel_event,
+            )
+            if proposed is None:
+                proposed = {}
+                model_error = (
+                    self.llm_client.get_last_error()
+                    or "模型未返回可用的局部变量命名建议"
+                )
+
+        improved, metadata = CodeProcessor.apply_conservative_rename_plan(
+            pseudocode, proposed, allowed_model_sources=candidates
+        )
+        mapping = metadata.get("rename_mapping", {})
+        if not mapping or not CodeProcessor.has_meaningful_change(
+            pseudocode, improved
+        ):
+            return "", False, (
+                model_error or "未发现可安全应用的局部变量重命名"
+            )
+
+        rename_valid, rename_error, confirmed = (
+            CodeProcessor.validate_local_rename_only(pseudocode, improved)
+        )
+        syntax_ok, syntax_error = CodeProcessor.basic_syntax_check(improved)
+        semantic_ok, semantic_error = CodeProcessor.validate_semantic_preservation(
+            pseudocode,
+            improved,
+            self.config.get("llm.minimum_output_ratio", 0.45),
+        )
+        if not rename_valid or not syntax_ok or not semantic_ok:
+            reason = rename_error or syntax_error or semantic_error
+            return "", False, f"保守重命名本地校验失败: {reason}"
+
+        model_mapping = metadata.get("model_mapping", {})
+        deterministic_mapping = metadata.get("deterministic_mapping", {})
+        rejected = metadata.get("rejected_model_mapping", {})
+        if rejected:
+            self.logger.info(
+                "已忽略 %s 个不安全或无效的模型命名建议" % len(rejected)
+            )
+        if model_error and deterministic_mapping:
+            self.logger.warning(
+                f"{model_error}，已直接应用本地确定性命名"
+            )
+
+        result_kind = (
+            "model_local_rename" if model_mapping
+            else "local_readability_fallback"
+        )
+        return improved, True, {
+            "result_kind": result_kind,
+            "renamed_locals": len(confirmed),
+            "rename_mapping": confirmed,
+            "model_renamed_locals": len(model_mapping),
+            "deterministic_renamed_locals": len(deterministic_mapping),
+        }
+
     def _get_model_result_metadata(self, pseudocode: str, processed_code: str):
-        """Validate local-only edits only when the effective mode is conservative."""
-        conservative = self._is_conservative_mode(pseudocode)
+        """Describe a validated full rewrite for presentation and caching."""
         rename_valid, rename_error, rename_metadata = (
             CodeProcessor.validate_local_rename_only(pseudocode, processed_code)
         )
-        if conservative and not rename_valid:
-            return None, rename_error
-
-        if conservative:
-            return {
-                "result_kind": "model_local_rename",
-                "renamed_locals": len(rename_metadata),
-                "rename_mapping": rename_metadata,
-            }, ""
-
         # Full rewrites may also rename locals, but token-level mapping is not
         # reliable after a control-flow or expression transformation.
         return {
@@ -189,14 +265,15 @@ class OptimizationHandler:
         }, ""
 
     @staticmethod
-    def _format_model_validation_failure(rename_error: str, conservative: bool) -> str:
-        mode_label = "保守" if conservative else "全量"
+    def _format_model_validation_failure(rename_error: str, conservative=False) -> str:
         return (
-            f"模型输出未通过{mode_label}改写校验: "
+            "模型输出未通过全量改写校验: "
             f"{rename_error}。原始伪代码未被替换，结果未缓存"
         )
 
-    def _process_model_candidate(self, pseudocode: str, context: dict, candidate: str) -> tuple:
+    def _process_model_candidate(
+        self, pseudocode: str, context: dict, candidate: str, cancel_event=None
+    ) -> tuple:
         """Validate one model output, with at most one bounded semantic repair.
 
         A repair is only warranted after the semantic guard rejects a complete
@@ -214,7 +291,7 @@ class OptimizationHandler:
             if result_metadata is None:
                 return "", False, (
                     self._format_model_validation_failure(
-                        rename_error, self._is_conservative_mode(pseudocode)
+                        rename_error
                     )
                 )
             if not CodeProcessor.has_meaningful_change(pseudocode, processed_code):
@@ -227,18 +304,31 @@ class OptimizationHandler:
             return self._fallback_to_local_readability(pseudocode, processing_error)
 
         attempts = self._get_quality_repair_attempts()
-        required_anchors = CodeProcessor.get_required_semantic_anchors(pseudocode)
-        conservative = self._is_conservative_mode(pseudocode)
-        repair_label = "自动保守修复" if conservative else "自动全量修复"
+        required_anchors = CodeProcessor.get_required_semantic_anchors(
+            pseudocode,
+            self.config.get("llm.quality_guard_profile", "balanced"),
+        )
+        repair_label = "自动全量修复"
         for attempt in range(1, attempts + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                return "", False, "请求已取消"
             violation = CodeProcessor.get_quality_rejection_reason(processing_error)
             self.logger.info(
                 "模型输出未通过安全校验（%s），正在进行%s（%s/%s）"
                 % (violation or "未保留原始语义", repair_label, attempt, attempts)
             )
-            repaired_code = self.llm_client.repair_code(
-                pseudocode, context, violation, required_anchors
-            )
+            if cancel_event is None:
+                repaired_code = self.llm_client.repair_code(
+                    pseudocode, context, violation, required_anchors
+                )
+            else:
+                repaired_code = self.llm_client.repair_code(
+                    pseudocode,
+                    context,
+                    violation,
+                    required_anchors,
+                    cancel_event=cancel_event,
+                )
             if repaired_code is None:
                 return "", False, (
                     self.llm_client.get_last_error()
@@ -255,7 +345,7 @@ class OptimizationHandler:
                 if result_metadata is None:
                     return "", False, (
                         self._format_model_validation_failure(
-                            rename_error, conservative
+                            rename_error
                         )
                     )
                 if not CodeProcessor.has_meaningful_change(pseudocode, processed_code):
@@ -268,6 +358,39 @@ class OptimizationHandler:
                 return self._fallback_to_local_readability(pseudocode, processing_error)
 
         return self._fallback_to_local_readability(pseudocode, processing_error)
+
+    @staticmethod
+    def _accepted_model_rewrite(success: bool, result_metadata) -> bool:
+        """Return whether the model candidate (or its repair) passed validation."""
+        return bool(
+            success
+            and isinstance(result_metadata, dict)
+            and result_metadata.get("result_kind") == "model_full_rewrite"
+        )
+
+    def _show_rejected_candidate(
+        self, pseudocode: str, candidate: str, context: dict
+    ) -> bool:
+        """Show a rejected full-rewrite candidate without caching it."""
+        if not self.config.get("llm.show_rejected_candidate", False):
+            return False
+        if not candidate or not candidate.strip():
+            return False
+
+        display_context = dict(context or {})
+        display_context["result_kind"] = "model_rejected_candidate"
+        display_context["renamed_locals"] = 0
+        stats = CodeProcessor.calculate_diff_stats(pseudocode, candidate)
+        shown = ResultPresenter.show_optimized_window(
+            candidate, display_context, stats
+        )
+        if shown:
+            ResultPresenter.print_to_output(
+                "已展示未通过安全流程的模型候选（不缓存）"
+            )
+        else:
+            self.logger.warning("显示被拒绝的模型候选失败")
+        return shown
 
     def _publish_result(
         self,
@@ -304,20 +427,6 @@ class OptimizationHandler:
             ResultPresenter.print_to_output(message)
             return False
 
-        if not cache_hit and self.cache and self.config.get("plugin.enable_cache", True):
-            try:
-                self.cache.set(
-                    address,
-                    pseudocode,
-                    processed_code,
-                    function_name,
-                    stats,
-                    cache_metadata,
-                )
-                self.logger.debug(f"已缓存优化结果: {function_name}")
-            except Exception as exc:
-                self.logger.warning(f"缓存保存失败: {exc}")
-
         display_context = dict(context or {})
         display_context["result_kind"] = result_kind
         display_context["renamed_locals"] = renamed_locals
@@ -344,13 +453,30 @@ class OptimizationHandler:
         if not ResultPresenter.show_optimized_window(processed_code, display_context, stats):
             return False
 
+        # Only persist a newly generated result after the viewer has accepted
+        # it.  Otherwise a transient IDA viewer failure would turn into a cache
+        # hit on the next invocation even though the user never saw the result.
+        if not cache_hit and self.cache and self.config.get("plugin.enable_cache", True):
+            try:
+                self.cache.set(
+                    address,
+                    pseudocode,
+                    processed_code,
+                    function_name,
+                    stats,
+                    cache_metadata,
+                )
+                self.logger.debug(f"已缓存优化结果: {function_name}")
+            except Exception as exc:
+                self.logger.warning(f"缓存保存失败: {exc}")
+
         cache_suffix = " (缓存)" if cache_hit else ""
         source_label = (
             "本地安全美化"
             if result_kind == "local_readability_fallback"
             else "模型全量重写"
             if result_kind == "model_full_rewrite"
-            else "模型保守美化"
+            else "模型辅助命名"
         )
         rename_suffix = f"，重命名 {renamed_locals} 个局部变量" if renamed_locals else ""
         result_msg = (
@@ -427,10 +553,6 @@ class OptimizationHandler:
             ResultPresenter.show_error(error_msg)
             return False
 
-        # 检查 LLM 服务是否就绪（auto_start 场景下可能还在启动中）
-        if not self._ensure_service_ready():
-            return False
-
         try:
             with ProgressDialog("CHelper - 正在提取代码...") as progress:
                 # 1. 提取代码和上下文
@@ -480,40 +602,56 @@ class OptimizationHandler:
 
                 # 3. 调用LLM优化（未命中缓存时）
                 if not cache_hit:
-                    progress.update("CHelper - 正在调用大模型优化...")
+                    if self._requires_model_service(pseudocode):
+                        if not self._ensure_service_ready():
+                            return False
+                        progress.update("CHelper - 正在调用大模型优化...")
+                    else:
+                        progress.update("CHelper - 正在应用本地确定性命名...")
 
                     # 检查是否可以取消
                     if progress.check_cancelled():
                         self.logger.info("用户取消优化")
                         return False
 
-                    optimized_code = self.llm_client.optimize_code(pseudocode, context)
-
-                    if optimized_code is None:
-                        model_error = (
-                            self.llm_client.get_last_error()
-                            or "LLM优化失败，请检查配置和模型服务"
-                        )
+                    if self._is_conservative_mode(pseudocode):
                         processed_code, success, result_metadata = (
-                            self._fallback_to_local_readability(
-                                pseudocode, model_error
+                            self._process_conservative_rename_plan(
+                                pseudocode, context
                             )
                         )
-                        if not success:
-                            self._report_failure(model_error)
-                            return False
                     else:
-                        # 4. 后处理
-                        progress.update("CHelper - 正在处理结果...")
-
-                        # 再次检查取消
-                        if progress.check_cancelled():
-                            self.logger.info("用户取消优化")
-                            return False
-
-                        processed_code, success, result_metadata = self._process_model_candidate(
-                            pseudocode, context, optimized_code
+                        optimized_code = self.llm_client.optimize_code(
+                            pseudocode, context
                         )
+                        if optimized_code is None:
+                            model_error = (
+                                self.llm_client.get_last_error()
+                                or "LLM优化失败，请检查配置和模型服务"
+                            )
+                            processed_code, success, result_metadata = (
+                                self._fallback_to_local_readability(
+                                    pseudocode, model_error
+                                )
+                            )
+                        else:
+                            # 4. 后处理
+                            progress.update("CHelper - 正在处理结果...")
+
+                            # 再次检查取消
+                            if progress.check_cancelled():
+                                self.logger.info("用户取消优化")
+                                return False
+
+                            processed_code, success, result_metadata = self._process_model_candidate(
+                                pseudocode, context, optimized_code
+                            )
+                            if not self._accepted_model_rewrite(
+                                success, result_metadata
+                            ):
+                                self._show_rejected_candidate(
+                                    pseudocode, optimized_code, context
+                                )
 
                     if not success:
                         error_msg = self._format_processing_failure(result_metadata)
@@ -562,6 +700,9 @@ class OptimizationHandler:
                 self.logger.info("CHelper 已有任务在处理中，本次快捷键已忽略。")
                 return False
             self._busy = True
+            self._cancel_event.clear()
+            self._generation += 1
+            generation = self._generation
 
         started = False
         try:
@@ -602,6 +743,21 @@ class OptimizationHandler:
                     )
                     return result
 
+            requires_service = self._requires_model_service(pseudocode)
+            if not requires_service:
+                ResultPresenter.print_to_output(f"正在优化函数: {function_name}")
+                ResultPresenter.print_to_output("正在应用本地确定性命名...")
+                target = self._async_worker
+                worker = threading.Thread(
+                    target=target,
+                    args=(pseudocode, context, address, function_name, cache_metadata, generation),
+                    name="CHelper-Optimization",
+                    daemon=True,
+                )
+                worker.start()
+                started = True
+                return True
+
             # Do not discard the user's first request while the background
             # service loader is still warming up.  Cache hits above work even
             # before the model is ready; uncached requests are queued below.
@@ -621,18 +777,18 @@ class OptimizationHandler:
 
             ResultPresenter.print_to_output(f"正在优化函数: {function_name}")
             if service_ready:
-                ida_kernwin.show_wait_box("CHelper - 正在调用大模型优化...")
+                ResultPresenter.print_to_output("正在调用大模型优化...")
                 target = self._async_worker
             else:
                 elapsed = svc.get_elapsed()
-                ida_kernwin.show_wait_box("CHelper - 模型服务启动中，任务已排队...")
                 ResultPresenter.print_to_output(
                     f"模型服务启动中（已等待 {elapsed} 秒），已排队并会在就绪后自动开始。"
                 )
                 target = self._wait_for_service_then_optimize
             worker = threading.Thread(
                 target=target,
-                args=(pseudocode, context, address, function_name, cache_metadata),
+                args=(pseudocode, context, address, function_name, cache_metadata, generation),
+                name="CHelper-Optimization",
                 daemon=True,
             )
             worker.start()
@@ -640,10 +796,6 @@ class OptimizationHandler:
             return True
         except Exception as exc:
             self._set_busy(False)
-            try:
-                ida_kernwin.hide_wait_box()
-            except Exception:
-                pass
             ResultPresenter.show_error(f"启动异步优化失败: {exc}")
             self.logger.exception(f"启动异步优化失败: {exc}")
             return False
@@ -656,8 +808,31 @@ class OptimizationHandler:
         with self._busy_lock:
             self._busy = value
 
+    def cancel(self):
+        """Request cancellation of the active background optimization."""
+        with self._busy_lock:
+            if not self._busy:
+                return False
+            self._cancel_event.set()
+            self._generation += 1
+        ResultPresenter.print_to_output("优化任务已请求取消")
+        self.logger.info("CHelper 优化任务已请求取消")
+        return True
+
+    def shutdown(self):
+        """Invalidate pending work before the plugin is unloaded."""
+        with self._busy_lock:
+            self._cancel_event.set()
+            self._generation += 1
+
+    def _is_cancelled(self, generation=None):
+        with self._busy_lock:
+            return self._cancel_event.is_set() or (
+                generation is not None and generation != self._generation
+            )
+
     def _wait_for_service_then_optimize(
-        self, pseudocode, context, address, function_name, cache_metadata
+        self, pseudocode, context, address, function_name, cache_metadata, generation
     ):
         """Wait off the UI thread, then run the normal optimization worker."""
         svc = get_service_manager()
@@ -668,9 +843,12 @@ class OptimizationHandler:
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
+            if self._is_cancelled(generation):
+                self._set_busy(False)
+                return
             if svc.is_ready() or svc.check_now():
                 self._async_worker(
-                    pseudocode, context, address, function_name, cache_metadata
+                    pseudocode, context, address, function_name, cache_metadata, generation
                 )
                 return
 
@@ -678,67 +856,89 @@ class OptimizationHandler:
             if status == "failed":
                 self._queue_async_completion(
                     pseudocode, context, address, function_name, cache_metadata,
-                    None, f"模型服务启动失败：{svc.get_error()}"
+                    None, f"模型服务启动失败：{svc.get_error()}",
+                    generation=generation,
                 )
                 return
             if status == "disabled":
                 self._queue_async_completion(
                     pseudocode, context, address, function_name, cache_metadata,
-                    None, "模型服务未启动，请启动服务后重试。"
+                    None, "模型服务未启动，请启动服务后重试。",
+                    generation=generation,
                 )
                 return
-            time.sleep(1.0)
+            self._cancel_event.wait(1.0)
 
         self._queue_async_completion(
             pseudocode, context, address, function_name, cache_metadata,
-            None, f"等待模型服务就绪超时（{timeout} 秒）"
+            None, f"等待模型服务就绪超时（{timeout} 秒）",
+            generation=generation,
         )
 
-    def _async_worker(self, pseudocode, context, address, function_name, cache_metadata):
+    def _async_worker(self, pseudocode, context, address, function_name, cache_metadata, generation):
         """Run network/post-processing work off the IDA UI thread."""
+        rejected_candidate = None
         try:
-            optimized_code = self.llm_client.optimize_code(pseudocode, context)
-            if optimized_code is None:
-                model_error = (
-                    self.llm_client.get_last_error()
-                    or "LLM优化失败，请检查配置和模型服务"
-                )
-                processed_code, success, result_metadata = self._fallback_to_local_readability(
-                    pseudocode, model_error
-                )
-                if not success:
-                    self._queue_async_completion(
-                        pseudocode, context, address, function_name, cache_metadata,
-                        None, model_error
+            if self._is_cancelled(generation):
+                return
+            if self._is_conservative_mode(pseudocode):
+                processed_code, success, result_metadata = (
+                    self._process_conservative_rename_plan(
+                        pseudocode, context, cancel_event=self._cancel_event
                     )
-                    return
-            else:
-                processed_code, success, result_metadata = self._process_model_candidate(
-                    pseudocode, context, optimized_code
                 )
+            else:
+                optimized_code = self.llm_client.optimize_code(
+                    pseudocode, context, cancel_event=self._cancel_event
+                )
+                if optimized_code is None:
+                    model_error = (
+                        self.llm_client.get_last_error()
+                        or "LLM优化失败，请检查配置和模型服务"
+                    )
+                    processed_code, success, result_metadata = self._fallback_to_local_readability(
+                        pseudocode, model_error
+                    )
+                else:
+                    processed_code, success, result_metadata = self._process_model_candidate(
+                        pseudocode, context, optimized_code, cancel_event=self._cancel_event
+                    )
+                    if (
+                        self.config.get("llm.show_rejected_candidate", False)
+                        and not self._accepted_model_rewrite(success, result_metadata)
+                    ):
+                        rejected_candidate = optimized_code
+            if self._is_cancelled(generation):
+                return
             if not success:
                 error_msg = self._format_processing_failure(result_metadata)
                 self._queue_async_completion(
                     pseudocode, context, address, function_name, cache_metadata,
-                    None, error_msg
+                    None, error_msg, generation=generation,
+                    rejected_candidate=rejected_candidate,
                 )
                 return
             if not processed_code or not processed_code.strip():
                 self._queue_async_completion(
                     pseudocode, context, address, function_name, cache_metadata,
-                    None, "代码处理失败：结果为空"
+                    None, "代码处理失败：结果为空", generation=generation,
+                    rejected_candidate=rejected_candidate,
                 )
                 return
 
             self._queue_async_completion(
                 pseudocode, context, address, function_name, cache_metadata,
-                processed_code, "", result_metadata
+                processed_code, "", result_metadata, generation,
+                rejected_candidate=rejected_candidate,
             )
         except Exception as exc:
             self._queue_async_completion(
                 pseudocode, context, address, function_name, cache_metadata,
-                None, f"异步优化失败: {exc}"
+                None, f"异步优化失败: {exc}", generation=generation
             )
+        finally:
+            if self._is_cancelled(generation):
+                self._set_busy(False)
 
     def _queue_async_completion(
         self,
@@ -750,10 +950,17 @@ class OptimizationHandler:
         processed_code,
         error_message,
         result_metadata=None,
+        generation=None,
+        rejected_candidate=None,
     ):
         def complete_on_ui():
             try:
-                ida_kernwin.hide_wait_box()
+                if self._is_cancelled(generation):
+                    return False
+                if rejected_candidate:
+                    self._show_rejected_candidate(
+                        pseudocode, rejected_candidate, context
+                    )
                 if error_message:
                     self._report_failure(error_message)
                     return False

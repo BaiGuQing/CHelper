@@ -8,7 +8,7 @@ IDA 加载子目录插件时会把本目录作为 Python 包导入（import CHel
 允许 cache、processor 等不依赖 IDA 的模块被独立测试。
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __author__ = "BaiGuQing"
 
 

@@ -1,485 +1,419 @@
-# CHelper — IDA Pro 9.x 反编译代码 AI 优化插件
+# CHelper
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+面向 IDA Pro 9.x 的本地大模型反编译辅助插件。
 
-CHelper 是一个 IDA Pro 插件，利用**本地大语言模型**将 Hex-Rays 反编译器
-生成的伪 C 代码重写为更干净、更易读、更接近人类手写的代码——包括 OLLVM
-反混淆、表达式简化、变量智能重命名、自动添加注释，一键搞定。
+CHelper 从 Hex-Rays 提取当前函数的伪 C 代码，通过 OpenAI 兼容接口调用
+llama.cpp、vLLM、Ollama 或其他模型服务，对代码进行变量命名、表达式简化、
+控制流整理、注释补充和反混淆辅助。生成结果显示在独立查看器中，不会直接
+覆盖 IDA 原始伪代码。
 
-> **为什么用本地模型？** 代码不会离开你的机器。所有推理都通过
-> OpenAI 兼容 API 访问自托管模型（llama.cpp / vLLM / Ollama）。
-> 如需在线模型，也可切换到任意 OpenAI 兼容端点。
+> AI 生成的代码只能作为逆向分析参考。即使开启质量检测，也不能替代人工
+> 核对、动态调试、符号执行或其他语义验证手段。
 
----
+## 主要功能
 
-## 功能特性
-
-- **一键优化** —— 在反编译窗口按 `Ctrl+Alt+C`，当前函数交给后台线程
-  调用 LLM，完成后结果在新查看器标签页弹出，IDA 界面保持响应。
-- **非阻塞异步流水线** —— 代码提取与结果展示在 IDA 线程执行，只有
-  网络请求与纯 Python 后处理在后台工作线程运行。服务还在预热时发出的
-  请求会自动排队，就绪后自动开始。
-- **多种本地后端** —— 内置 llama.cpp server、vLLM、Ollama，或任意
-  OpenAI 兼容端点（本地或在线）。
-- **推理模型感知** —— 自动剥离 DeepSeek-R1 / VibeThinker 等推理模型
-  输出的 `think…/think` 思考块，并支持当模型把答案塞进思考块时从中提取代码
-  的回退逻辑。`llm.reasoning: "off"` 与 `reasoning_budget: 0` 让
-  llama.cpp 优先输出代码，不再为推理 token 占预算。
-- **OLLVM 反混淆** —— 简化控制流平坦化、虚假控制流、魔数除法。只有
-  检测到真实的 OLLVM 模式时才下发反混淆指令，避免小模型对普通代码
-  "幻觉式简化"。
-- **表达式简化 & 智能命名** —— 折叠冗余运算，根据上下文推断有意义的
-  变量名。
-- **三段式结果分类** —— 每个结果都会标记为 `模型保守美化`、
-  `模型全量重写` 或 `本地安全美化`，并在查看器标题区显示。
-- **优化结果查看器** —— 结果在 IDA 自定义查看器中显示，配色与原生
-  伪代码窗口对齐，重命名后的局部变量仍沿用 Hex-Rays 的语义颜色，
-  支持双击跳转到已加载地址和 IDA 符号，且永不修改原始伪代码视图。
-- **磁盘缓存** —— 相同函数重复优化瞬间返回。缓存按 prompt 版本、
-  模型与生成参数命名空间隔离，切换模型或关键配置后自动失效旧缓存。
-  `Ctrl+Alt+R` 强制跳过缓存重新生成。
-- **自动启动 llama.cpp / vLLM** —— 插件加载时自动拉起后端进程，
-  轮询直到 API 就绪，卸载时自动清理。
-- **安全质量门** —— 拒绝丢失函数签名、调用、字符串/数值常量或
-  IDA 全局符号的输出；拒绝引入未验证的调用/全局；拒绝不完整片段、
-  被截断输出和空白等价无改动。无效结果永不缓存，也永不覆盖原始
-  伪代码。
-- **有界质量修复** —— 当模型完整输出未通过语义校验时，CHelper 会
-  以原始伪代码为唯一权威进行一次严格修复重试，然后才回退。
-- **本地安全美化兜底** —— 若模型输出完全不可用，会执行一次确定性、
-  保持语法的本地重命名（如 `input_buffer`、`scan_result`、
-  `input_cursor`），并再次执行全部语法与语义校验，结果明确标记。
-- **快捷键冲突自动解决** —— 优先选择 `Ctrl+Alt+C` / `Ctrl+Alt+R`
-  （旧版 `Ctrl+Shift+C` / `Ctrl+Shift+R` 与 IDA 内置动作冲突），
-  检测到与其他动作冲突时自动选取空闲的回退键。
-- **右键菜单** —— 通过 `UI_Hooks` 在伪代码窗口右键菜单附加
-  *CHelper → 优化伪C代码* / *优化伪C代码（强制刷新）*。
-- **配置校验** —— 加载时校验 `config.json`，在 IDA 输出窗口以友好
-  格式报错并弹出警告对话框。
-- **回归测试套件** —— 纯 Python 模块（cache、processor、llm_client、
-  presenter、service_manager、config_validator、handler）由 `tests/`
-  覆盖，可在无 IDA 环境下运行。
-- **支持 IDA 9.0+。**
-
----
+- 在 Hex-Rays 伪代码窗口中一键调用本地大模型。
+- 后台执行模型请求，避免长时间阻塞 IDA 主界面。
+- 支持 llama.cpp、vLLM、Ollama 和 OpenAI 兼容接口。
+- 支持完整函数重写和保守变量命名两种工作方式。
+- 自动清理 Markdown、`<think>`、`<thinking>` 等模型输出外壳。
+- 支持 Qwen、DeepSeek 等模型的 thinking/reasoning 模式。
+- 可检测模型重复退化、不完整函数、语法错误和语义锚点变化。
+- 支持仅冻结 `byte_*`、`g_*`、`dword_*` 等 IDA 全局符号。
+- 模型候选未通过检测时，可单独打开候选窗口进行人工分析。
+- 模型不可用时，可回退到本地确定性变量命名。
+- 通过安全流程并成功显示的结果可以写入磁盘缓存。
+- 结果查看器支持语法配色、`Ctrl+A`、`Ctrl+C` 和双击跳转符号。
 
 ## 环境要求
 
-| 组件 | 说明 |
-|------|------|
-| IDA Pro | 9.0 或更高版本（SDK ≥ 900） |
-| Hex-Rays | 反编译器（F5）已安装 |
-| Python | IDA 自带的 Python 3 |
-| 操作系统 | Windows（内置 llama.cpp 为 `.exe`）；Linux/macOS 需自行提供 `llama-server` / `vllm` |
-| GPU | 推荐 CUDA 显卡以获得可接受的延迟；纯 CPU 可用但较慢 |
-| 磁盘 | 约 1–6 GB，取决于所选模型 |
-
----
+| 项目 | 要求 |
+|---|---|
+| IDA Pro | 9.0 或更高版本 |
+| Hex-Rays | 已安装并可正常使用 F5 反编译 |
+| Python | IDA 自带 Python 3 |
+| Python 依赖 | `requests` |
+| 模型接口 | OpenAI 兼容的 `/v1/chat/completions` |
+| 推荐后端 | llama.cpp server |
+| 操作系统 | 当前主要面向 Windows |
 
 ## 安装
 
-### 1. 获取代码
+### 1. 放置插件
 
-```bash
-git clone https://github.com/BaiGuQing/CHelper.git
-```
+将整个 `CHelper` 目录放到 IDA 插件目录：
 
-插件依赖 `requests`。如果 IDA 自带的 Python 环境中尚未安装，请先执行：
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-### 2. 复制文件到 IDA 插件目录
-
-仓库包含一个**引导加载器**（`loader/CHelper.py`）和**插件包**
-（其余所有文件）。IDA 9.x 只自动加载 `plugins/` 目录*直接*下的 `.py`
-文件，不扫描子目录，因此两者都需要：
-
-```
-<IDA>/plugins/
-  ├── CHelper.py            ← 引导加载器 （来自 repo/loader/CHelper.py）
-  └── CHelper/              ← 插件包      （来自 repo 根目录）
-        ├── __init__.py
+```text
+IDA Professional 9.4/
+└── plugins/
+    └── CHelper/
         ├── CHelper.py
-        ├── config.py
         ├── config.json
-        ├── llm_client.py
         ├── handler.py
-        ├── …
-        ├── tests/          ← 回归测试（运行时不需要）
-        ├── .llama_bin/     ← （可选）llama.cpp 二进制，见第 4 步
-        └── <model>.gguf    ← （可选）模型权重，见第 3 步
+        ├── llm_client.py
+        ├── processor.py
+        └── ...
 ```
 
-**具体操作：**
+CHelper 是子目录包插件，不要只复制单个 `CHelper.py`。
 
-1. 复制 `loader/CHelper.py` → `<IDA>/plugins/CHelper.py`
-2. 复制仓库其余文件（`__init__.py`、`CHelper.py`、`config.py`、
-   `config.json`、`*.py`、`requirements.txt`、`tests/`）→
-   `<IDA>/plugins/CHelper/`
+### 2. 安装依赖
 
-> **IDA 插件目录位置**
-> - **Windows：** `C:\Program Files\IDA Pro 9.x\plugins\`
-> - **Linux：** `~/.idapro/plugins/`  *（或 `$IDA/plugins/`）*
-> - **macOS：** `/Applications/IDA Pro 9.x/idabin/plugins/`
+使用 IDA 对应的 Python 环境安装：
 
-### 3. 下载模型
-
-模型权重**不**包含在仓库中（文件过大不适合 Git）。下载推荐的 GGUF
-文件之一，放到 `<IDA>/plugins/CHelper/` 目录下：
-
-| 模型 | 大小 | 格式 | 说明 |
-|------|------|------|------|
-| DeepSeek-R1-SFT / Distill-Qwen-1.5B | ~1.1 GB | GGUF Q4_K_M | 仅适合试用；不可靠地保持复杂反编译语义 |
-| VibeThinker-3B | ~2 GB | GGUF / safetensors | 可用于轻量整理，仍需审查 |
-| **qwen2.5-coder:7b** | ~4.7 GB | GGUF / Ollama | 推荐起点：代码能力、速度与质量均衡 |
-| deepseek-coder:6.7b | ~3.8 GB | GGUF / Ollama | 快，显存占用低 |
-
-> 默认 `config.json` 以 `auto_start: true` 和本地
-> `DeepSeek-R1-SFT-Q4_K_M.gguf` 模型路径配合内置 llama.cpp server。
-> 如需使用已运行的 Ollama 服务，请设置 `auto_start: false`、
-> `api_url: "http://127.0.0.1:11434/v1/chat/completions"`、
-> `model: "qwen2.5-coder:7b"`。
-
-### 4.（可选）下载 llama.cpp server 二进制
-
-插件可以自动启动本地 `llama-server`。预编译的 Windows 二进制（CUDA 12）
-单独分发——下载 `.llama_bin/` 文件夹，放到
-`<IDA>/plugins/CHelper/.llama_bin/` 内。
-
-插件查找的关键文件是：
-
+```powershell
+python -m pip install requests
 ```
+
+### 3. 准备模型
+
+当前配置使用：
+
+```text
+models/CHelper-Qwen3.5-4B-v1.Q4_K_M.gguf
+```
+
+模型名称和路径在 [config.json](./config.json) 中设置：
+
+```jsonc
+"model": "CHelper-Qwen3.5-4B-v1",
+"model_path": "models/CHelper-Qwen3.5-4B-v1.Q4_K_M.gguf"
+```
+
+### 4. 准备 llama-server
+
+将 `llama-server.exe` 放入：
+
+```text
 CHelper/.llama_bin/llama-server.exe
 ```
 
-如果你已有 `llama-server` 在 `PATH` 中，或更倾向用 vLLM / Ollama，
-可以跳过此步并调整 `config.json`（见下文）。
+当 `auto_start` 为 `true` 时，插件会自动检测并启动服务。
 
 ### 5. 重启 IDA
 
-启动后应在输出窗口看到：
+正常加载时，IDA 输出窗口会出现类似信息：
 
-```
-[CHelper] v1.3.0 加载成功
+```text
+[CHelper] v1.4.0 加载成功
 [CHelper] 在反编译窗口按 Ctrl+Alt+C 优化代码
-[CHelper] 在反编译窗口按 Ctrl+Alt+R 强制刷新（忽略缓存）
-[CHelper] LLM API: http://127.0.0.1:8000/v1/chat/completions
-[CHelper] 模型: DeepSeek-R1-SFT-Q4_K_M.gguf
+[CHelper] LLM API: http://127.0.0.1:8080/v1/chat/completions
 ```
 
-如果 `auto_start` 开启，插件会在后台启动 `llama-server` 并等待就绪
-（首次加载到显存约 30–90 秒）。服务就绪前发出的请求会自动排队，
-就绪后自动开始。
+## 快速使用
 
----
-
-## 使用方法
-
-1. 在 IDA 中打开目标程序。
-2. 按 `F5` 用 Hex-Rays 反编译函数。
-3. **在伪代码窗口中按 `Ctrl+Alt+C`**
-   （或右键菜单 → *CHelper -> 优化伪C代码*）。
-4. 等待几秒钟 LLM 处理。等待框显示进度，可用 IDA 取消按钮中止。
-5. 优化后的代码在新查看器标签页打开
-   （`CHelper - <函数名> @ <地址>`），标题区显示结果类型、函数名、
-   地址、行数变化与重命名的局部变量数量。
-6. 与原始伪代码对照，手动应用重命名/注释。在查看器中双击已加载
-   地址或 IDA 符号可跳转。
+1. 在 IDA 中定位目标函数。
+2. 按 `F5` 打开 Hex-Rays 伪代码窗口。
+3. 按 `Ctrl+Alt+C` 优化当前函数。
+4. 等待模型服务生成结果。
+5. 在 CHelper 结果标签页中人工核对代码。
 
 ### 快捷键
 
-| 快捷键 | 功能 |
-|--------|------|
-| `Ctrl+Alt+C` | 优化当前函数（有缓存时使用缓存） |
-| `Ctrl+Alt+R` | 强制重新优化，忽略缓存 |
+| 快捷键 | 作用 |
+|---|---|
+| `Ctrl+Alt+C` | 优化当前函数，允许使用缓存 |
+| `Ctrl+Alt+R` | 强制重新生成，忽略缓存 |
+| `Ctrl+A` | 在结果查看器中全选 |
+| `Ctrl+C` | 复制查看器选中内容 |
 
-> 若任一快捷键与其他动作冲突，CHelper 会自动选取空闲回退键
-> （如 `Ctrl+Alt+Shift+C`），并在加载时打印最终使用的快捷键。
+如果快捷键与其他 IDA 动作冲突，插件会尝试使用备用快捷键，并在输出窗口打印
+最终绑定结果。
 
-### 结果类型
+## 结果窗口
 
-| 查看器标题 | 含义 |
-|-----------|------|
-| `CHelper 模型保守美化` | 模型仅重命名局部标识符 + 加注释（保守模式） |
-| `CHelper 模型全量重写` | 模型重写了表达式/控制流/局部变量（全量模式） |
-| `CHelper 本地安全美化` | 模型输出不可用；改用确定性本地重命名兜底 |
+CHelper 不会直接修改 IDA 原始伪代码，而是打开独立查看器。
 
-### 缓存
+常见结果类型：
 
-结果按函数地址、伪代码、函数上下文以及模型/配置指纹、prompt 版本、
-缓存 schema 命名空间缓存到磁盘。重复优化同一函数瞬间返回，切换模型
-或关键生成参数后会自动失效旧缓存。要清空缓存，删除插件目录下的
-`.cache/` 文件夹，或对单个函数按 `Ctrl+Alt+R`。
+| 类型 | 含义 |
+|---|---|
+| 模型全量重写 | 模型生成的完整函数已被采用 |
+| 模型辅助命名 | 模型只返回变量命名 JSON，由插件本地执行替换 |
+| 本地安全美化 | 模型失败或被拒绝，改用本地确定性命名 |
+| 模型候选（未通过安全检测） | 被拒绝的模型候选，仅供人工查看，不缓存 |
 
----
+候选窗口只有在 `show_rejected_candidate` 开启且模型结果最终未被采用时才会
+弹出。通过检测时只显示正式结果。
 
-## 配置说明
+## 配置文件
 
-编辑插件目录下的 `config.json`。主要字段：
+[config.json](./config.json) 已按功能分组，并为每个配置项提供了中文注释。
 
-### `llm` —— 模型与后端
+配置加载器支持 JSONC 注释：
 
 ```jsonc
-{
-  "llm": {
-    "api_url": "http://127.0.0.1:8000/v1/chat/completions",
-    "model": "DeepSeek-R1-SFT-Q4_K_M.gguf",
-    "temperature": 0.0,
-    "max_tokens": 2048,
-    "timeout": 300,
-    "api_key": "",
+// 单行注释
 
-    "strip_reasoning": true,          // 剥离推理模型的 think…/think 思考块
-    "reasoning_tags": ["think", "thinking"],
-    "reasoning": "off",               // llama.cpp：禁用推理 token，优先输出代码
-    "reasoning_budget": 0,            // 立即结束 think，减少推理 token 占用
-
-    "auto_start": true,               // 加载时启动 llama-server / vllm
-    "backend": "llama_cpp",           // "llama_cpp" | "vllm" | "openai"
-    "model_path": "DeepSeek-R1-SFT-Q4_K_M.gguf",
-    "vllm_binary": "vllm",
-    "llama_server_binary": "",        // 空则自动查找 .llama_bin/llama-server.exe
-    "n_gpu_layers": -1,              // -1 = 全部 offload 到 GPU
-    "context_size": 8192,
-    "startup_timeout": 180,
-
-    // 生成质量控制
-    "repeat_penalty": 1.05,
-    "frequency_penalty": 0.0,
-    "presence_penalty": 0.0,
-    "send_extended_parameters": false,// true 时向 llama.cpp 发送 top_k/min_p
-    "top_p": 0.95,
-    "top_k": 40,
-    "min_p": 0.0,
-    "seed": null,                      // 设为整数可复现采样
-
-    // 健壮性 / 安全
-    "conservative_mode": "off",        // "off" | "on" | "auto"
-    "degeneration_guard": true,        // 截断重复行退化输出
-    "quality_guard": true,             // 拒绝丢失语义锚点的输出
-    "minimum_output_ratio": 0.30,      // 拒绝低于此比例的输出
-    "restore_unused_parameter_signature": true,
-    "local_readability_fallback": true,// 原样/不安全输出时启用确定性局部命名兜底
-    "quality_repair_attempts": 1,      // 质量门拒绝后仅自动严格修复一次
-    "max_retry_attempts": 3,           // HTTP 重试
-    "retry_delay": 1.0
-  }
-}
+/* 多行
+   块注释 */
 ```
 
-**`conservative_mode`** 控制重写风险：
-- `"off"` —— 允许全量重写、删除冗余和调整控制流；质量门仍检查函数
-  签名、输出完整性、长度和新增调用/全局。
-- `"on"` *（默认推荐用于反编译伪代码）* —— 只重命名局部变量 + 加注释，
-  不改逻辑。
-- `"auto"` —— 仅检测到魔数除法等硬骨头时使用保守模式；建议配合 7B+
-  代码模型。
+字符串中的 `http://`、`https://` 和类似注释的文本不会被误删。
 
-如果希望全量模式完全不做语义锚点检查，可另外设置
-`"quality_guard": false`，但这会接受模型删除原始调用、全局符号和常量
-的结果，建议只在确认模型可靠时使用。
+## 工作模式
 
-### `plugin` —— 界面与运行时
+### 全量重写
 
 ```jsonc
-{
-  "plugin": {
-    "hotkey": "Ctrl+Alt+C",
-    "hotkey_force": "Ctrl+Alt+R",
-    "max_function_size": 10000,
-    "debug": false,                   // 保存 LLM 请求/响应到 .debug/
-    "log_file": "chelper.log",
-    "enable_cache": true,
-    "cache_dir": ".cache",
-    "cache_max_age_days": 30,
-    "cache_cleanup_on_start": true
-  }
-}
+"conservative_mode": "off"
 ```
 
-### `optimization` —— LLM 应做什么
+模型可以重新组织表达式、循环、分支、调用、字符串和局部变量。实际允许范围
+还取决于 `quality_guard` 和 `quality_guard_profile`。
+
+适合：
+
+- 控制流整理
+- 表达式简化
+- 变量重命名
+- 注释生成
+- 混淆代码辅助分析
+
+### 保守命名
 
 ```jsonc
-{
-  "optimization": {
+"conservative_mode": "on"
+```
+
+模型只返回局部变量命名 JSON，代码替换由插件在原始伪代码上完成。模型无法
+直接重新生成控制流、调用或常量。
+
+适合参数量较小或完整函数生成不稳定的模型。
+
+### 自动模式
+
+```jsonc
+"conservative_mode": "auto"
+```
+
+插件根据检测到的代码特征选择工作方式。
+
+## 安全总开关
+
+### 完全关闭检测
+
+```jsonc
+"quality_guard": false
+```
+
+关闭后，插件会跳过：
+
+- 重复退化检测
+- 完整函数检测
+- 括号和基础语法检测
+- 函数签名恢复与校验
+- 最低输出长度检测
+- 调用、字符串、常量和全局符号检测
+- 自动安全修复
+
+模型输出只会经过 Markdown 和 reasoning 外壳清理，然后直接显示。
+
+此时 `quality_guard_profile` 不生效。
+
+### 开启检测
+
+```jsonc
+"quality_guard": true,
+"quality_guard_profile": "balanced"
+```
+
+开启后，插件执行完整质量流程。检测范围由 profile 决定。
+
+| Profile | 必须保留 | 可以修改 |
+|---|---|---|
+| `strict` | 调用、字符串、数值常量、IDA 全局符号 | 局部结构和命名 |
+| `balanced` | 调用、字符串、IDA 全局符号 | 数值等价表达式、局部结构和命名 |
+| `globals_only` | `g_*`、`byte_*`、`dword_*`、`qword_*` 等全局符号集合 | 调用、字符串、数值、局部变量和控制流 |
+
+如果只希望保持 `byte_2080` 这类变量不变：
+
+```jsonc
+"quality_guard": true,
+"quality_guard_profile": "globals_only"
+```
+
+## 推理模式
+
+当前 Qwen3.5 模型的聊天模板支持 `<think>` 和 `enable_thinking`。
+
+推荐从有限预算开始：
+
+```jsonc
+"reasoning": "on",
+"reasoning_effort": null,
+"reasoning_budget": 512,
+"strip_reasoning": true,
+"max_tokens": 4096
+```
+
+说明：
+
+- `reasoning` 是 llama.cpp 服务端推理开关。
+- `reasoning_budget` 控制 thinking token 数量。
+- `reasoning_effort` 设为 `null`，避免请求层再次发送 `none`。
+- `strip_reasoning` 只影响展示，不会阻止模型进行推理。
+- 推理会增加耗时，也可能挤占最终代码的输出 token。
+
+修改 `reasoning` 或 `reasoning_budget` 后必须彻底重启 llama-server。仅重新按
+快捷键不会改变已经运行的服务参数。
+
+## 全量优化目标
+
+`optimization` 配置只主要影响全量重写模式：
+
+```jsonc
+"optimization": {
     "deobfuscate_ollvm": true,
     "simplify_expressions": true,
+    "rewrite_control_flow": true,
     "improve_naming": true,
     "add_comments": true,
-    "unroll_simple_loops": false,
-    "rewrite_control_flow": true
-  }
+    "unroll_simple_loops": false
 }
 ```
 
-`rewrite_control_flow: true` 会允许模型主动重写指针循环、哨兵边界和
-分支结构，但提示词仍要求核对边界、终止条件、返回值和副作用，避免
-改变实际行为。
+其中 OLLVM 指令只有在插件检测到相关特征后才会加入 Prompt。
 
-### 使用 Ollama
+## 连接其他后端
 
-```bash
-ollama pull qwen2.5-coder:7b
-ollama serve
-```
+### Ollama
 
 ```jsonc
-{
-  "llm": {
-    "backend": "llama_cpp",
-    "api_url": "http://localhost:11434/v1/chat/completions",
-    "model": "qwen2.5-coder:7b",
-    "auto_start": false,
-    "strip_reasoning": false,
-    "conservative_mode": "on"
-  }
-}
+"backend": "openai",
+"auto_start": false,
+"api_url": "http://127.0.0.1:11434/v1/chat/completions",
+"model": "your-model"
 ```
 
-### 使用 vLLM 替代 llama.cpp
+### vLLM
 
 ```jsonc
-{
-  "llm": {
-    "backend": "vllm",
-    "api_url": "http://localhost:8000/v1/chat/completions",
-    "model": "VibeThinker-3B",
-    "model_path": "/path/to/VibeThinker-3B"   // safetensors 目录
-  }
-}
+"backend": "vllm",
+"auto_start": true,
+"model_path": "models/your-hf-model",
+"model": "your-model"
 ```
 
-### 使用 OpenAI 兼容在线模型
-
-插件使用标准的 `POST /v1/chat/completions` 请求格式，OpenAI、DeepSeek、
-OpenRouter 以及其他兼容服务都可以使用同一配置方式：
+### 在线 OpenAI 兼容接口
 
 ```jsonc
-{
-  "llm": {
-    "backend": "openai",
-    "api_url": "https://api.openai.com/v1/chat/completions",
-    "model": "gpt-4o-mini",
-    "api_key": "sk-替换为你的密钥",
-    "auto_start": false,
-    "send_extended_parameters": false,
-    "conservative_mode": "on"
-  }
-}
+"backend": "openai",
+"auto_start": false,
+"api_url": "https://example.com/v1/chat/completions",
+"model": "model-name",
+"api_key": "your-api-key"
 ```
 
-使用其他服务时，只需替换 `api_url`、`model` 和 `api_key`。`api_url`
-可以填写完整的 `/v1/chat/completions` 地址，也可以只填写 `/v1` 基地址，
-插件会自动补全。密钥仅保存在本地 `config.json`，不要提交到代码仓库。
+使用在线接口意味着伪代码会发送到第三方服务器，请自行评估代码隐私和合规
+风险。
 
----
+## 缓存
 
-## 项目结构
+缓存默认保存在 `.cache/`。
 
-```
-CHelper/                     ← 仓库根目录 = 插件包
-├── loader/
-│   └── CHelper.py           ← 引导加载器（复制到 plugins/CHelper.py）
-├── tests/                   ← 回归测试（无 IDA 也可运行）
-│   ├── __init__.py
-│   ├── test_config_validator.py
-│   ├── test_handler_quality_repair.py
-│   ├── test_llm_client.py
-│   ├── test_presenter.py
-│   ├── test_processor.py
-│   └── test_service_manager.py
-├── __init__.py              ← 包初始化，延迟导出 PLUGIN_ENTRY
-├── CHelper.py               ← 主插件类（IDA plugin_t）+ 右键菜单钩子
-├── handler.py               ← 异步优化流程编排 & 质量修复
-├── extractor.py             ← 伪代码、上下文 & 语义颜色提取
-├── llm_client.py            ← LLM API 客户端 + Prompt/修复 Prompt 构建
-├── processor.py             ← 后处理、tokenizer、语义锚点校验
-├── presenter.py             ← 自定义查看器（C 语法高亮 + 双击跳转）
-├── service_manager.py       ← 自动启动 llama-server / vllm 子进程
-├── cache.py                 ← 命名空间磁盘缓存（schema v3）
-├── config.py                ← 配置加载（含默认值）
-├── config_validator.py      ← 启动时配置校验
-├── constants.py             ← 共享常量 & 正则模式
-├── logger.py                ← 统一日志
-├── result.py                ← Result/ErrorCode 错误处理
-├── config.json              ← 用户可编辑配置
-├── requirements.txt
-├── .gitignore
-├── README.md                ← （英文）
-└── README.zh-CN.md          ← （本文件）
-```
+缓存键包含：
 
-### 运行测试
+- 函数地址和原始伪代码
+- 函数上下文
+- 模型名称和 API 地址
+- 生成参数
+- Prompt 版本
+- 质量检测配置
+- 优化目标
 
-纯 Python 模块可在无 IDA 环境下测试。在仓库根目录执行：
+以下情况会跳过或失效缓存：
 
-```bash
-python -m unittest discover -s tests -v
-# 或安装了 pytest 时：
-pytest tests/
+- 使用 `Ctrl+Alt+R`
+- 原始伪代码发生变化
+- 模型或重要配置发生变化
+- Prompt/schema 版本升级
+
+被拒绝、未显示或空白等价的结果不会写入缓存。
+
+## 日志与调试
+
+主要文件：
+
+| 文件或目录 | 内容 |
+|---|---|
+| `chelper.log` | 插件业务日志 |
+| `.debug/service.log` | llama-server/vLLM 输出 |
+| `.debug/request_*.json` | 调试模式下保存的模型请求 |
+| `.debug/response_*.json` | 调试模式下保存的模型响应 |
+| `.cache/` | 已验证结果缓存 |
+
+启用请求与响应转储：
+
+```jsonc
+"debug": true
 ```
 
----
+调试文件可能包含待分析的完整伪代码，请勿随意上传。
 
 ## 常见问题
 
-**插件无法加载**
-- 确认 IDA ≥ 9.0 且 Hex-Rays 已安装。
-- 检查 `loader/CHelper.py` 是否已复制到 `plugins/CHelper.py`
-  （不是放在 `CHelper/` 子目录里面）。
-- 查看 IDA 输出窗口的错误信息。配置校验错误还会弹出警告对话框。
+### 模型服务一直在启动
 
-**LLM 调用失败**
-- 如果开启了 `auto_start`，首次使用时模型加载到显存需要时间
-  （约 30–90 秒）。仍在启动时会提示"模型服务正在启动中"；排队的
-  请求会在服务就绪后自动开始。
-- 手动测试端点：`curl http://localhost:8000/v1/models`
-- 确保 `llm.model` 与服务器报告的名称一致。
-- 查看 `chelper.log` 了解详情。
+- 查看 `.debug/service.log`。
+- 检查模型路径和 llama-server 路径。
+- 检查显存是否足够。
+- 调大 `startup_timeout`。
 
-**输出中混入 `think` 内容**
-- 设置 `llm.strip_reasoning: true`，并确保标签在
-  `llm.reasoning_tags` 列表中。
-- llama.cpp 后端建议同时设置 `llm.reasoning: "off"` 和
-  `reasoning_budget: 0`。
+### 修改推理配置后没有变化
 
-**优化效果不理想**
-- 1–3B 推理模型不适合可靠地重写反编译逻辑；建议改用代码专用的 7B+
-  Instruct 模型（例如 `qwen2.5-coder:7b`）。
-- 保持 `llm.reasoning: "off"`、`temperature: 0.0`、
-  `conservative_mode: "on"` 和 `quality_guard: true`；质量门拒绝完整
-  结果时会自动进行一次更严格的修复，仍不安全的结果不会覆盖或缓存
-  原始伪代码。
-- 如果模型原样返回或未通过校验，CHelper 会明确标记为"本地安全美化"：
-  仅重命名有确定证据的局部变量，并再次执行语法和语义校验。
-- 使用 `Ctrl+Alt+R` 强制刷新，或重启 IDA，使新的服务参数和缓存 schema
-  生效。
-- 开启 `plugin.debug: true`，检查 `.debug/` 下的请求/响应转储；请注意
-  其中可能包含待分析代码。
+`reasoning`、`reasoning_budget` 和上下文大小属于服务启动参数。请关闭旧的
+llama-server 进程并重启 IDA。
 
-**函数太大**
-- 调大 `plugin.max_function_size`，但注意 LLM 超时 / 上下文限制。
-- 考虑先手动拆分函数。
+### 候选被误判为重复退化
 
-**快捷键无效**
-- 可能其他动作占用了该键。CHelper 在加载时会打印最终使用的快捷键；
-  若输出窗口出现"快捷键 … 冲突"提示，请在 IDA 的 Shortcut editor 中
-  手动绑定一个空闲键。
+当前检测会忽略连续闭合括号、变量声明和简单常量初始化，真正复杂的重复模板
+需要连续达到阈值才会触发。如果仍然误报，请保留候选代码和日志以便复现。
 
----
+### 同一函数无法再次打开结果窗口
 
-## 性能参考
+IDA 的 `simplecustviewer_t` 不允许创建同名窗口。关闭旧的同名 CHelper 标签页
+后重新生成。
 
-| 模型 | GPU | 每函数耗时 |
-|------|-----|-----------|
-| DeepSeek-R1-Distill-Qwen-1.5B | RTX 3060 | ~2–5 秒 |
-| VibeThinker-3B | RTX 3060 | ~4–8 秒 |
-| qwen2.5-coder:7b | RTX 3060 | ~3–5 秒 |
-| deepseek-coder:6.7b | RTX 3060 | ~2–4 秒 |
+### `Ctrl+A` 无法全选
 
----
+新版查看器会显式触发 IDA 的 `SelectAll` 动作。更新插件并重启 IDA 后生效。
+
+### 模型输出很差或经常截断
+
+- 使用 `temperature: 0.0`。
+- 增加 `max_tokens`。
+- 关闭或限制 reasoning budget。
+- 小模型优先使用 `conservative_mode: "on"`。
+- 使用 `Ctrl+Alt+R` 排除旧缓存影响。
+
+## 项目结构
+
+```text
+CHelper/
+├── CHelper.py             # IDA 插件入口
+├── handler.py             # 异步流程、模式路由、修复和兜底
+├── extractor.py           # Hex-Rays 伪代码与上下文提取
+├── llm_client.py          # Prompt 和 OpenAI 兼容请求
+├── processor.py           # 输出清理与质量检测
+├── presenter.py           # 结果查看器
+├── service_manager.py     # llama.cpp/vLLM 服务管理
+├── cache.py               # 磁盘缓存
+├── config.py              # JSONC 配置加载
+├── config_validator.py    # 配置校验
+├── config.json            # 用户配置
+├── models/                # 本地模型（不提交到 Git）
+└── images/                # 文档图片和收款码
+```
+
+## 请我喝一杯咖啡
+
+如果 CHelper 对你的逆向分析有所帮助，欢迎请我喝一杯咖啡。感谢你的支持，
+也欢迎提交问题、改进建议和测试样例。
+
+| 微信 | 支付宝 |
+|---|---|
+| <img src="./images/wechat.jpg" alt="微信收款码" width="280"> | <img src="./images/alipay.jpg" alt="支付宝收款码" width="280"> |
 
 ## 许可证
 
@@ -491,5 +425,5 @@ MIT License
 
 ## 免责声明
 
-本插件通过 AI 模型生成的代码**仅供参考**。请务必在使用前手动验证
-输出。进行逆向工程时请遵守相关法律法规。
+本插件生成的代码仅供学习、研究和辅助分析。使用者应自行验证输出的正确性，
+并确保逆向工程行为符合当地法律法规、软件许可协议和授权范围。

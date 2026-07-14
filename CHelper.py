@@ -18,7 +18,7 @@ from .config_validator import ConfigValidator
 
 # 插件元信息
 PLUGIN_NAME = "CHelper"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.4.0"
 PLUGIN_AUTHOR = "BaiGuQing"
 ACTION_NAME = "chelper:optimize_code"
 ACTION_NAME_FORCE = "chelper:optimize_code_force"  # 强制刷新动作
@@ -168,14 +168,27 @@ class CHelperPlugin(idaapi.plugin_t):
         # 注销动作
         self._unregister_actions()
 
+        try:
+            if self.handler:
+                self.handler.shutdown()
+        except Exception as exc:
+            logger.warning(f"取消后台优化任务失败: {exc}")
+
         # 清理子进程
         try:
-            svc = get_service_manager()
-            if svc:
-                svc.stop()
-                logger.info("后台服务进程清理完成")
+            from .service_manager import shutdown_service_manager
+            shutdown_service_manager()
+            logger.info("后台服务进程清理完成")
         except Exception as e:
             logger.warning(f"清理子进程失败: {e}")
+
+        try:
+            from .cache import reset_cache
+            from .config import reset_config
+            reset_cache()
+            reset_config()
+        except Exception as e:
+            logger.warning(f"清理插件单例状态失败: {e}")
 
         logger.info(f"{PLUGIN_NAME} 已卸载")
         print(f"[{PLUGIN_NAME}] 已卸载")

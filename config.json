@@ -1,58 +1,109 @@
 {
     "llm": {
-        "api_url": "http://127.0.0.1:8000/v1/chat/completions",
-        "model": "DeepSeek-R1-SFT-Q4_K_M.gguf",
-        "temperature": 0.0,
-        "max_tokens": 2048,
-        "timeout": 300,
-        "api_key": "",
-        "strip_reasoning": true,
-        "reasoning_tags": ["think", "thinking"],
-        "auto_start": true,
-        "backend": "llama_cpp",
-        "model_path": "DeepSeek-R1-SFT-Q4_K_M.gguf",
-        "vllm_binary": "vllm",
-        "llama_server_binary": "",
-        "n_gpu_layers": -1,
-        "context_size": 8192,
-        "startup_timeout": 180,
-        "repeat_penalty": 1.05,
-        "frequency_penalty": 0.0,
-        "presence_penalty": 0.0,
-        "send_extended_parameters": false,
-        "reasoning": "off",
-        "reasoning_budget": 0,
-        "conservative_mode": "off",
-        "degeneration_guard": true,
-        "quality_guard": true,
-        "minimum_output_ratio": 0.30,
-        "restore_unused_parameter_signature": true,
-        "local_readability_fallback": true,
-        "quality_repair_attempts": 1,
-        "seed": null,
-        "top_p": 0.95,
-        "top_k": 40,
-        "min_p": 0.0,
-        "max_retry_attempts": 3,
-        "retry_delay": 1.0
+        // ================================================================
+        // 1. API 与后端
+        // ================================================================
+        "backend": "llama_cpp", // llama_cpp: 本地 GGUF；vllm: 本地 HF 模型；openai: 外部兼容 API
+        "api_url": "http://127.0.0.1:8080/v1/chat/completions", // OpenAI 兼容的 Chat Completions 地址
+        "model": "CHelper-Qwen3.5-4B-v1", // API 请求中使用的模型名，必须与服务端一致
+        "api_key": "", // 鉴权密钥；本地 llama.cpp 通常留空
+        "timeout": 120, // 单次 HTTP 请求超时时间，单位秒
+
+        // ================================================================
+        // 2. 本地模型服务
+        // ================================================================
+        "auto_start": true, // IDA 加载插件时自动检测并启动 llama-server/vLLM
+        "model_path": "models/CHelper-Qwen3.5-4B-v1.Q4_K_M.gguf", // llama.cpp 的 GGUF 文件或 vLLM 模型目录
+        "llama_server_binary": "", // llama-server 路径；留空时自动使用 .llama_bin/llama-server.exe
+        "vllm_binary": "vllm", // vLLM 可执行文件名或完整路径
+        "n_gpu_layers": -1, // llama.cpp GPU 卸载层数；-1 表示尽可能全部放入 GPU
+        "context_size": 8192, // llama.cpp 上下文窗口 token 数
+        "startup_timeout": 180, // 等待模型加载完成的最长时间，单位秒
+
+        // ================================================================
+        // 3. 生成参数
+        // ================================================================
+        "temperature": 0.0, // 采样随机性；代码重写建议 0.0
+        "max_tokens": 20480, // 单次回复允许生成的最大 token 数
+        "top_p": 0.95, // nucleus sampling 累计概率阈值
+        "top_k": 40, // 仅在 send_extended_parameters=true 时发送
+        "min_p": 0.0, // 最小相对概率阈值；0 表示关闭
+        "repeat_penalty": 1.05, // 轻度抑制重复退化；C 代码不宜设置过高
+        "frequency_penalty": 0.0, // 按 token 出现频率惩罚；代码任务建议保持 0
+        "presence_penalty": 0.0, // 按 token 是否出现过惩罚；代码任务建议保持 0
+        "seed": null, // 整数可复现生成结果；null 使用后端默认随机种子
+        "send_extended_parameters": false, // true 时额外发送 repeat_penalty/top_k/min_p；严格 OpenAI API 可能拒绝
+
+        // ================================================================
+        // 4. 推理模式与输出清理
+        // ================================================================
+        "reasoning": "off", // llama.cpp 推理开关：off/on/auto
+        "reasoning_effort": "none", // OpenAI/Ollama 推理强度：none/low/medium/high/max
+        "reasoning_budget": 0, // llama.cpp 推理 token 预算；0 表示立即结束 thinking
+        "strip_reasoning": true, // 从模型回复中移除 <think>/<thinking> 内容
+        "reasoning_tags": ["think", "thinking"], // 需要清理的推理标签名
+
+        // ================================================================
+        // 5. 重写模式
+        // ================================================================
+        "conservative_mode": "off", // off: 全量重写；on: 只做安全命名；auto: 检测到重度混淆时转保守模式
+        "conservative_model_renames": true, // 保守模式下允许模型返回局部变量 JSON 命名建议
+
+        // ================================================================
+        // 6. 安全、质量门与兜底
+        // ================================================================
+        "quality_guard": false, // 安全总开关；false 时跳过退化、完整性、语法、签名和语义检测，直接展示候选
+        // quality_guard_profile 可选值：
+        //   strict       : 最严格。必须保留原始函数调用、字符串、数值常量和
+        //                  g_*/byte_*/dword_*/qword_* 等 IDA 全局符号；不允许新增调用或全局符号。
+        //   balanced     : 平衡模式。保留函数调用、字符串和 IDA 全局符号；
+        //                  允许数值常量改写为等价表达式，不允许新增调用或全局符号。
+        //   globals_only : 宽松模式。只要求 IDA 全局符号集合完全不变；局部变量、
+        //                  函数调用、字符串、数值、表达式和控制流都允许重写。
+        // 仅当 quality_guard=true 时 profile 才生效；完整性、签名、语法和退化检测也属于该总开关。
+        "quality_guard_profile": "globals_only",
+        "show_rejected_candidate": true, // 仅在模型候选最终未被采用时展示该候选；不缓存、不写回 IDA
+
+        // ================================================================
+        // 7. HTTP 重试
+        // ================================================================
+        "max_retry_attempts": 1, // 超时、连接失败、429 或 5xx 时的最大请求次数
+        "retry_delay": 1.0 // 首次重试前等待秒数，后续指数退避
     },
+
     "plugin": {
-        "hotkey": "Ctrl+Alt+C",
-        "hotkey_force": "Ctrl+Alt+R",
-        "max_function_size": 10000,
-        "debug": false,
-        "log_file": "chelper.log",
-        "enable_cache": true,
-        "cache_dir": ".cache",
-        "cache_max_age_days": 30,
-        "cache_cleanup_on_start": true
+        // ================================================================
+        // 8. IDA 交互
+        // ================================================================
+        "hotkey": "Ctrl+Alt+C", // 普通优化；优先使用缓存
+        "hotkey_force": "Ctrl+Alt+R", // 强制刷新；跳过缓存重新请求模型
+        "max_function_size": 10000, // 允许发送给模型的最大伪代码字符数
+
+        // ================================================================
+        // 9. 缓存
+        // ================================================================
+        "enable_cache": true, // 缓存已通过检查且成功显示的结果
+        "cache_dir": ".cache", // 缓存目录，相对于插件目录
+        "cache_max_age_days": 30, // 缓存最长保留天数
+        "cache_cleanup_on_start": true, // 插件启动时删除过期缓存
+
+        // ================================================================
+        // 10. 日志与调试
+        // ================================================================
+        "debug": false, // true 时把 LLM 请求和回复 JSON 保存到 .debug/
+        "log_file": "chelper.log", // 插件业务日志文件，相对于插件目录
+        "service_log_file": "" // llama-server/vLLM stdout/stderr；留空时使用 .debug/service.log
     },
+
     "optimization": {
-        "deobfuscate_ollvm": true,
-        "simplify_expressions": true,
-        "improve_naming": true,
-        "add_comments": true,
-        "unroll_simple_loops": false,
-        "rewrite_control_flow": true
+        // ================================================================
+        // 11. 全量重写目标（conservative_mode=off 时主要生效）
+        // ================================================================
+        "deobfuscate_ollvm": true, // 检测到真实 OLLVM 特征时要求简化平坦化/虚假控制流
+        "simplify_expressions": true, // 简化复杂表达式和冗余计算
+        "rewrite_control_flow": true, // 允许重组循环、分支、提前返回和指针/索引结构
+        "improve_naming": true, // 为局部变量生成更有意义的英文名称
+        "add_comments": true, // 在关键逻辑附近添加简短注释
+        "unroll_simple_loops": false // 允许展开简单循环；容易放大代码，默认关闭
     }
 }

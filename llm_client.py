@@ -4,9 +4,11 @@ LLM客户端 - 与本地大模型通信
 """
 
 import json
+import ast
 import re
 import requests
 import time
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 from .constants import (
@@ -16,6 +18,7 @@ from .constants import (
     RETRY_DELAY_MULTIPLIER,
     MAX_RETRY_DELAY,
     OLLVM_MAGIC_PATTERNS,
+    PROMPT_VERSION as PROMPT_PROTOCOL_VERSION,
 )
 from .logger import get_logger
 
@@ -25,7 +28,7 @@ class LLMClient:
 
     # Bump this whenever prompt semantics change; cache.py includes it in its
     # namespace so an old, less-safe prompt result is never silently reused.
-    PROMPT_VERSION = "safe-c-v8"
+    PROMPT_VERSION = PROMPT_PROTOCOL_VERSION
 
     @staticmethod
     def _normalize_chat_completions_url(api_url: str) -> str:
@@ -38,6 +41,22 @@ class LLMClient:
         if url.endswith("/v1"):
             return f"{url}/chat/completions"
         return f"{url}/v1/chat/completions"
+
+    @staticmethod
+    def _models_url_from_api_url(api_url: str) -> str:
+        """Build /models while preserving any configured proxy path prefix."""
+        from urllib.parse import urlparse
+
+        parsed = urlparse(str(api_url or "").strip())
+        path = (parsed.path or "").rstrip("/")
+        suffix = "/chat/completions"
+        if path.endswith(suffix):
+            path = path[:-len(suffix)]
+        elif not path.endswith("/v1"):
+            path = f"{path}/v1" if path else "/v1"
+        return parsed._replace(
+            path=f"{path}/models", params="", query="", fragment=""
+        ).geturl()
 
     def __init__(self, config):
         """初始化LLM客户端
@@ -65,6 +84,7 @@ class LLMClient:
         self.top_k = config.get("llm.top_k", 40)
         self.min_p = config.get("llm.min_p", 0.0)
         self.seed = config.get("llm.seed", None)
+        self.reasoning_effort = config.get("llm.reasoning_effort", None)
         self.last_error = ""
         self.last_response_info = {}
         try:
@@ -103,6 +123,16 @@ class LLMClient:
         """Expose the effective rewrite mode to the result validator."""
         return self._should_use_conservative(pseudocode)
 
+    def _effective_quality_profile(self) -> str:
+        """Return off when the master quality switch is disabled."""
+        if not self.config.get("llm.quality_guard", True):
+            return "off"
+        profile = str(
+            self.config.get("llm.quality_guard_profile", "balanced")
+            or "balanced"
+        ).lower()
+        return profile if profile in ("strict", "balanced", "globals_only") else "balanced"
+
     def _apply_penalties(self, payload: dict):
         """向请求 payload 注入重复退化抑制参数
 
@@ -131,17 +161,11 @@ class LLMClient:
             payload["seed"] = self.seed
 
     def _build_prompt(self, pseudocode: str, context: dict) -> str:
-        """构建优化提示词
+        """Build the full-rewrite prompt.
 
-        Args:
-            pseudocode: IDA反编译的伪C代码
-            context: 上下文信息（函数名、类型定义等）
-
-        Returns:
-            完整的prompt
+        Conservative mode has a separate structured rename-plan API and must
+        never reach this complete-function generation path.
         """
-        if self._should_use_conservative(pseudocode):
-            return self._build_conservative_prompt(pseudocode, context)
         return self._build_full_prompt(pseudocode, context)
 
     @staticmethod
@@ -154,9 +178,13 @@ class LLMClient:
         return ""
 
     @staticmethod
-    def _build_messages(prompt: str, conservative: bool = True) -> list:
+    def _build_messages(
+        prompt: str, conservative: bool = True, system_content: str = None
+    ) -> list:
         """Build a role-separated request supported by OpenAI-compatible APIs."""
-        if conservative:
+        if system_content is not None:
+            pass
+        elif conservative:
             system_content = (
                 "You are a careful reverse engineer. Return only one complete C "
                 "function. Never invent behavior. Preserve every token except "
@@ -177,16 +205,152 @@ class LLMClient:
             {"role": "user", "content": prompt},
         ]
 
+    @staticmethod
+    def _parse_rename_plan(content: str) -> Optional[dict]:
+        """Parse a small-model rename reply with light envelope tolerance."""
+        if not content:
+            return None
+        text = content.strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+        decoded = None
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(text):
+            if char not in "{[":
+                continue
+            try:
+                decoded, _end = decoder.raw_decode(text[index:])
+                break
+            except json.JSONDecodeError:
+                continue
+        if decoded is None:
+            # Some small models emit a Python-style dict with single quotes.
+            # literal_eval keeps this tolerance local and does not execute code.
+            starts = [index for index, char in enumerate(text) if char in "{["]
+            for index in starts:
+                for end in range(len(text), index, -1):
+                    try:
+                        decoded = ast.literal_eval(text[index:end])
+                        break
+                    except (SyntaxError, ValueError):
+                        continue
+                if decoded is not None:
+                    break
+        if decoded is None:
+            return None
+
+        if isinstance(decoded, dict):
+            renames = decoded.get("renames", decoded)
+        else:
+            renames = decoded
+
+        if isinstance(renames, list):
+            items = renames
+            renames = {}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                source = item.get("from") or item.get("source")
+                target = item.get("to") or item.get("target")
+                if isinstance(source, str) and isinstance(target, str):
+                    renames[source] = target
+
+        if not isinstance(renames, dict):
+            return None
+        return {
+            str(source): target
+            for source, target in renames.items()
+            if isinstance(source, str) and isinstance(target, str)
+        }
+
+    def _build_conservative_rename_prompt(
+        self, pseudocode: str, context: dict, candidates: list
+    ) -> str:
+        """Build a short constrained naming task suitable for small models."""
+        candidate_json = json.dumps(candidates, ensure_ascii=False)
+        function_name = context.get("function_name", "") if context else ""
+        naming_context = self._compact_rename_context(pseudocode, candidates)
+        return (
+            "为 IDA 伪代码中的占位局部变量建议简短、保守的英文名称。\n"
+            "你不需要重写代码，也不要解释代码。\n"
+            f"函数名: {function_name or 'unknown'}\n"
+            f"只允许重命名这些变量: {candidate_json}\n\n"
+            "规则:\n"
+            "1. 只输出一行 JSON，格式必须是: "
+            '{"renames":{"v1":"meaningful_name"}}\n'
+            "2. JSON 中的键必须来自允许列表；不确定的变量直接省略。\n"
+            "3. 新名称必须是合法 C 标识符，使用 snake_case，不要与函数、类型或 API 同名。\n"
+            "4. 不要输出注释、Markdown、代码或额外字段。没有可靠建议时输出 "
+            '{"renames":{}}。\n\n'
+            f"IDA 伪代码上下文:\n{naming_context}\n"
+        )
+
+    @staticmethod
+    def _compact_rename_context(
+        pseudocode: str, candidates: list, max_chars: int = 5000
+    ) -> str:
+        """Keep small functions intact and excerpt only candidate uses in large ones."""
+        source = pseudocode or ""
+        if len(source) <= max_chars or not candidates:
+            return source
+        lines = source.splitlines()
+        pattern = re.compile(
+            r"\b(?:" + "|".join(re.escape(name) for name in candidates) + r")\b"
+        )
+        selected = set(range(min(3, len(lines))))
+        for index, line in enumerate(lines):
+            if pattern.search(line):
+                selected.update(range(max(0, index - 2), min(len(lines), index + 3)))
+
+        rendered = []
+        previous = None
+        for index in sorted(selected):
+            if previous is not None and index > previous + 1:
+                rendered.append("// ...")
+            rendered.append(lines[index])
+            previous = index
+        compact = "\n".join(rendered)
+        return compact[:max_chars]
+
     def _build_full_prompt(self, pseudocode: str, context: dict) -> str:
         optimization_flags = self.config.get("optimization", {})
         source_signature = self._get_source_signature(pseudocode)
+        quality_profile = self._effective_quality_profile()
+
+        if quality_profile == "off":
+            invariant_rule = (
+                "2. 当前未启用安全检测；除必须输出一个 C 函数外，"
+                "不设置签名、调用、字符串、常量或全局符号不变约束。\n"
+            )
+            rewrite_rule = (
+                "3. 可以重写函数的任意内容，包括调用、字符串、数值、"
+                "全局符号引用、表达式、控制流和局部变量。\n"
+            )
+        elif quality_profile == "globals_only":
+            invariant_rule = (
+                "2. 函数签名和参数类型必须保留；原文中所有 IDA 全局符号"
+                "（如 g_*/byte_*/dword_*/qword_*）必须逐字保留，不得删除、"
+                "改名或新增。\n"
+            )
+            rewrite_rule = (
+                "3. 除上述不变项外，可以重写调用组织、字符串、数值、"
+                "表达式、循环、分支和局部变量。\n"
+            )
+        else:
+            invariant_rule = (
+                "2. 函数签名和参数类型必须保留；不得凭空引入外部调用或全局符号。\n"
+            )
+            rewrite_rule = (
+                "3. 可以重写表达式、循环、分支和局部变量，删除能够证明冗余的代码。\n"
+            )
 
         prompt_parts = [
             "你是专业的逆向工程专家。将以下 IDA 伪 C 做安全的全量可读性重写。\n",
             "【输出要求】\n",
             "1. 只输出一个完整 C 函数；不要解释、Markdown 或第二个答案。\n",
-            "2. 函数签名和参数类型必须保留；不得凭空引入外部调用或全局符号。\n",
-            "3. 可以重写表达式、循环、分支和局部变量，删除能够证明冗余的代码。\n",
+            invariant_rule,
+            rewrite_rule,
             "4. 重写循环/分支时必须保持边界、条件、返回值、副作用和必要类型转换等价。\n",
             "5. 不确定时保留原始逻辑；绝不能猜测或虚构行为。\n",
             "\n可选优化目标：\n",
@@ -228,7 +392,12 @@ class LLMClient:
             prompt_parts.append(f"\n函数名: {context['function_name']}")
 
         if source_signature:
-            prompt_parts.append(f"\n不可变函数签名（必须逐字保留）: {source_signature}")
+            if quality_profile == "off":
+                prompt_parts.append(
+                    f"\n原始函数签名（仅供参考，不做强制校验）: {source_signature}"
+                )
+            else:
+                prompt_parts.append(f"\n不可变函数签名（必须逐字保留）: {source_signature}")
 
         if context.get("types"):
             prompt_parts.append(
@@ -236,72 +405,10 @@ class LLMClient:
             )
 
         prompt_parts.append(f"\n\n待优化的代码:\n{pseudocode}\n")
-        prompt_parts.append("\n只输出完整 C 函数（从原函数签名开始，到最后的闭合大括号结束）：")
-
-        return "".join(prompt_parts)
-
-    def _build_conservative_prompt(self, pseudocode: str, context: dict) -> str:
-        """保守模式提示词：只重命名 + 加注释，逻辑一字不改
-
-        对 OLLVM 魔数除法/位旋转/状态机等小模型啃不动的硬骨头，
-        强行重建会丢逻辑或重复退化。保守模式下只做低风险美化：
-        - 保留每一行原始运算和操作符
-        - 仅把 v3/v5 等无意义变量名改成有语义的名字
-        - 在关键步骤前加 // 注释说明其作用
-        - 不删除、不合并、不重排任何表达式
-        """
-        source_signature = self._get_source_signature(pseudocode)
-        prompt_parts = [
-            "你是一个专业的逆向工程专家。",
-            "\n任务：对IDA Pro反编译的伪C代码做【保守美化】，不改动任何逻辑。\n",
-            "\n【严格输出格式】",
-            "1. 仅输出纯C代码，不要任何解释",
-            "2. 不要使用markdown代码块标记（```c 或 ```）",
-            "3. 必须输出完整函数（从函数签名到最后的}）",
-            "\n【保守规则 - 违反任何一条都算失败】：",
-            "1. 保留函数签名、参数类型、全部运算、操作符、调用、常量和控制流",
-            "2. 不得删除、合并、重排任何表达式或语句",
-            "3. 不得简化魔数除法、位旋转、状态机更新等复杂运算",
-            "4. 必须在有明确用途时，一致地重命名至少一个 IDA 局部变量；不可改函数名或参数名",
-            "5. 可添加简短注释，但不能修改已有语句、类型、调用、全局符号或常量",
-            "6. 命名线索：scanf 返回值用 scan_result/status；输入数组用 input_buffer；被解引用和递增的输入指针用 input_cursor；遍历 g_xxx 的指针用 xxx_cursor；输入末端哨兵用 input_end_marker",
-            "7. 只在名称含义明确时改名；否则保留该局部变量，绝不猜测逻辑",
-            "\n---\n",
-        ]
-
-        if context.get("function_name"):
-            prompt_parts.append(f"\n函数名: {context['function_name']}")
-
-        if source_signature:
-            prompt_parts.append(f"\n不可变函数签名（必须逐字保留）: {source_signature}")
-
-        if context.get("types"):
-            prompt_parts.append(
-                f"\n附加 IDA 类型线索（仅供局部变量参考，不能覆盖函数签名）:\n{context['types']}"
-            )
-
-        # These names come from deterministic, syntax-preserving evidence in
-        # the pseudocode. Giving the model an explicit map prevents it from
-        # either returning a no-op or inventing a semantic rewrite.
-        try:
-            from .processor import CodeProcessor
-            local_rename_hints = CodeProcessor.build_safe_local_rename_mapping(
-                pseudocode
-            )
-        except Exception:
-            local_rename_hints = {}
-        if local_rename_hints:
-            mapping_text = ", ".join(
-                f"{source} -> {target}"
-                for source, target in local_rename_hints.items()
-            )
-            prompt_parts.append(
-                "\n【已验证的局部变量映射】必须将以下每个局部变量的所有引用"
-                f"一致改名：{mapping_text}。除这些局部变量和注释外，禁止改变任何 token。"
-            )
-
-        prompt_parts.append(f"\n\n待美化的代码:\n{pseudocode}\n")
-        prompt_parts.append("\n请直接输出美化后的完整C代码（从函数签名开始）：")
+        if quality_profile == "off":
+            prompt_parts.append("\n只输出一个 C 函数，不要附加解释或 Markdown：")
+        else:
+            prompt_parts.append("\n只输出完整 C 函数（从原函数签名开始，到最后的闭合大括号结束）：")
 
         return "".join(prompt_parts)
 
@@ -316,75 +423,52 @@ class LLMClient:
         hallucinated rewrite when it is shown again as context.
         """
         source_signature = self._get_source_signature(pseudocode)
-        conservative = self._should_use_conservative(pseudocode)
-        if conservative:
-            prompt_parts = [
-                "上一轮 C 代码改写没有通过安全校验，必须进行一次严格修复。\n",
-                f"失败原因：{violation or '未保留原始语义锚点'}\n\n",
-                "【唯一权威输入】下面的 IDA 伪 C 原文是唯一可信来源。\n",
-                "【不可违反的规则】\n",
-                "1. 只输出一个完整 C 函数；不得输出解释或 Markdown。\n",
-                "2. 必须逐字保留函数签名、参数、每个语句的执行顺序、控制流、外部调用、IDA 全局符号、字符串和数值常量。\n",
-                "3. 只允许修改局部变量名或添加简短注释；不确定时必须原样复制原函数。\n",
-                "4. 绝不能删除、替换、合并或猜测任何逻辑；特别要修复上面的失败原因。\n",
-                "5. 修复时先以原始函数为底稿，确保失败原因中列出的每个缺失锚点逐字恢复；"
-                "不要用注释、字符串或新变量名代替原始 IDA 全局符号。\n",
-            ]
+        quality_profile = self._effective_quality_profile()
+        if quality_profile == "globals_only":
+            invariant_rule = (
+                "2. 必须保留函数签名和参数类型；所有原始 IDA 全局符号"
+                "必须逐字保留，不得删除、改名或新增。\n"
+            )
         else:
-            prompt_parts = [
-                "上一轮 C 代码全量重写没有通过安全校验，必须进行一次严格修复。\n",
-                f"失败原因：{violation or '未保留原始语义锚点'}\n\n",
-                "【唯一权威输入】下面的 IDA 伪 C 原文是唯一可信来源。\n",
-                "【不可违反的规则】\n",
-                "1. 只输出一个完整 C 函数；不得输出解释或 Markdown。\n",
-                "2. 必须保留函数签名和参数类型；不得引入原文不存在的外部调用或 IDA 全局符号。\n",
-                "3. 可以重写表达式、循环、分支和局部变量，也可以删除能够证明冗余的代码。\n",
-                "4. 重写循环/分支时必须保持边界、条件、返回值、副作用和必要类型转换等价。\n",
-                "5. 必须修复失败原因；不确定时保留原始逻辑。\n",
-                "6. 不要用注释、字符串或新变量名伪造原始 IDA 全局符号。\n",
-            ]
-            if self.config.get("optimization.rewrite_control_flow", False):
-                prompt_parts.append(
-                    "主动重写循环和分支：可将指针循环改成索引循环、合并等价分支、"
-                    "整理提前返回，但必须重新核对原始边界、终止条件和副作用。\n"
-                )
-            else:
-                prompt_parts.append(
-                    "保持原有控制流、循环边界和指针哨兵关系不变；"
-                    "不要将指针循环改写成索引循环。\n"
-                )
+            invariant_rule = (
+                "2. 必须保留函数签名和参数类型；不得引入原文不存在的外部调用或 IDA 全局符号。\n"
+            )
+        prompt_parts = [
+            "上一轮 C 代码全量重写没有通过安全校验，必须进行一次严格修复。\n",
+            f"失败原因：{violation or '未保留原始语义锚点'}\n\n",
+            "【唯一权威输入】下面的 IDA 伪 C 原文是唯一可信来源。\n",
+            "【不可违反的规则】\n",
+            "1. 只输出一个完整 C 函数；不得输出解释或 Markdown。\n",
+            invariant_rule,
+            "3. 可以重写表达式、循环、分支和局部变量，也可以删除能够证明冗余的代码。\n",
+            "4. 重写循环/分支时必须保持边界、条件、返回值、副作用和必要类型转换等价。\n",
+            "5. 必须修复失败原因；不确定时保留原始逻辑。\n",
+            "6. 不要用注释、字符串或新变量名伪造原始 IDA 全局符号。\n",
+        ]
+        if self.config.get("optimization.rewrite_control_flow", False):
+            prompt_parts.append(
+                "主动重写循环和分支：可将指针循环改成索引循环、合并等价分支、"
+                "整理提前返回，但必须重新核对原始边界、终止条件和副作用。\n"
+            )
+        else:
+            prompt_parts.append(
+                "保持原有控制流、循环边界和指针哨兵关系不变；"
+                "不要将指针循环改写成索引循环。\n"
+            )
         if context.get("function_name"):
             prompt_parts.append(f"\n函数名: {context['function_name']}\n")
         if source_signature:
             prompt_parts.append(f"不可变函数签名（必须逐字保留）: {source_signature}\n")
         if required_anchors:
-            if conservative:
-                anchor_label = "以下语义锚点是必须保留的最低清单（不是可选建议）："
-            else:
-                anchor_label = "以下是原始语义锚点清单，仅用于判断哪些内容可以安全整理："
+            anchor_label = "以下是原始语义锚点清单，仅用于判断哪些内容可以安全整理："
             prompt_parts.append(f"\n{anchor_label}\n{required_anchors}\n")
-
-        try:
-            from .processor import CodeProcessor
-            local_rename_hints = CodeProcessor.build_safe_local_rename_mapping(
-                pseudocode
-            )
-        except Exception:
-            local_rename_hints = {}
-        if conservative and local_rename_hints:
-            mapping_text = ", ".join(
-                f"{source} -> {target}"
-                for source, target in local_rename_hints.items()
-            )
-            prompt_parts.append(
-                "\n【已验证的局部变量修复映射】如果进行重命名，只能使用以下映射，"
-                f"并保持所有引用一致：{mapping_text}\n"
-            )
         prompt_parts.append(f"\n原始 IDA 伪 C:\n{pseudocode}\n")
         prompt_parts.append("\n现在仅输出安全修复后的完整 C 函数：")
         return "".join(prompt_parts)
 
-    def _make_request_with_retry(self, headers: dict, payload: dict) -> Optional[dict]:
+    def _make_request_with_retry(
+        self, headers: dict, payload: dict, cancel_event=None
+    ) -> Optional[dict]:
         """发送请求并支持重试
 
         Args:
@@ -397,7 +481,22 @@ class LLMClient:
         last_error = None
         delay = self.retry_delay
 
+        def retry_after_seconds(response):
+            value = response.headers.get("Retry-After") if response is not None else None
+            if not value:
+                return None
+            try:
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                try:
+                    return max(0.0, (parsedate_to_datetime(value).timestamp() - time.time()))
+                except (TypeError, ValueError, OverflowError):
+                    return None
+
         for attempt in range(self.max_retry_attempts):
+            if cancel_event is not None and cancel_event.is_set():
+                self.last_error = "请求已取消"
+                return None
             try:
                 self.logger.debug(f"LLM API 请求 (尝试 {attempt + 1}/{self.max_retry_attempts})")
 
@@ -422,9 +521,13 @@ class LLMClient:
             except requests.exceptions.HTTPError as e:
                 last_error = f"HTTP 错误: {e}"
                 self.logger.warning(f"{last_error} (尝试 {attempt + 1}/{self.max_retry_attempts})")
-                # HTTP 4xx 错误通常不应重试
-                if response.status_code >= 400 and response.status_code < 500:
+                # Retry rate limits and transient server failures; other 4xx
+                # responses are configuration/authentication errors.
+                if response.status_code < 500 and response.status_code != 429:
                     break
+                retry_after = retry_after_seconds(response)
+                if retry_after is not None:
+                    delay = min(retry_after, MAX_RETRY_DELAY)
 
             except requests.exceptions.RequestException as e:
                 last_error = f"请求异常: {e}"
@@ -438,7 +541,12 @@ class LLMClient:
             # 最后一次尝试失败，不等待
             if attempt < self.max_retry_attempts - 1:
                 self.logger.debug(f"等待 {delay:.1f} 秒后重试...")
-                time.sleep(delay)
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        self.last_error = "请求已取消"
+                        return None
+                else:
+                    time.sleep(delay)
                 delay = min(delay * RETRY_DELAY_MULTIPLIER, MAX_RETRY_DELAY)
 
         self.logger.error(f"LLM API 调用失败（已重试 {self.max_retry_attempts} 次）: {last_error}")
@@ -455,7 +563,8 @@ class LLMClient:
 
     def _request_code(
         self, prompt: str, request_kind: str = "optimize", temperature: float = None,
-        conservative: bool = True,
+        conservative: bool = True, cancel_event=None, max_tokens: int = None,
+        system_content: str = None,
     ) -> Optional[str]:
         """Submit one non-streaming code request and validate its envelope."""
         self.last_error = ""
@@ -470,11 +579,15 @@ class LLMClient:
 
         payload = {
             "model": self.model,
-            "messages": self._build_messages(prompt, conservative),
+            "messages": self._build_messages(
+                prompt, conservative, system_content=system_content
+            ),
             "temperature": self.temperature if temperature is None else temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
             "stream": False
         }
+        if self.reasoning_effort in ("none", "low", "medium", "high", "max"):
+            payload["reasoning_effort"] = self.reasoning_effort
         self._apply_penalties(payload)
 
         # 调试模式：保存请求
@@ -482,7 +595,7 @@ class LLMClient:
             self._save_debug_request(payload)
 
         # 使用重试机制发送请求
-        result = self._make_request_with_retry(headers, payload)
+        result = self._make_request_with_retry(headers, payload, cancel_event)
         if result is None:
             return None
 
@@ -535,19 +648,77 @@ class LLMClient:
             self.logger.exception(self.last_error)
             return None
 
-    def optimize_code(self, pseudocode: str, context: dict = None) -> Optional[str]:
-        """Synchronously ask the model for a normal optimization candidate."""
+    def optimize_code(
+        self, pseudocode: str, context: dict = None, cancel_event=None
+    ) -> Optional[str]:
+        """Ask for a complete full-mode rewrite candidate."""
         if context is None:
             context = {}
+        quality_profile = self._effective_quality_profile()
+        system_content = None
+        if quality_profile == "off":
+            system_content = (
+                "Return only one C function. The safety and invariant guard is "
+                "disabled, so you may rewrite the signature, calls, strings, "
+                "constants, global references, expressions, control flow, and "
+                "local variables without preservation constraints."
+            )
+        elif quality_profile == "globals_only":
+            system_content = (
+                "You are a careful reverse engineer. Return only one complete C "
+                "function. Preserve the exact function signature and the exact set "
+                "of IDA global symbols such as g_*, byte_*, dword_*, and qword_*. "
+                "You may rewrite calls, strings, constants, expressions, control "
+                "flow, and local variables, but do not rename, add, or remove those "
+                "IDA global symbols."
+            )
         return self._request_code(
             self._build_prompt(pseudocode, context),
             "optimize",
-            conservative=self._should_use_conservative(pseudocode),
+            conservative=False,
+            cancel_event=cancel_event,
+            system_content=system_content,
         )
+
+    def suggest_conservative_renames(
+        self, pseudocode: str, context: dict = None, candidates=None,
+        cancel_event=None,
+    ) -> Optional[dict]:
+        """Ask for a rename map instead of asking a small model to copy C code."""
+        context = context or {}
+        candidates = list(candidates or [])
+        if not candidates:
+            return {}
+        prompt = self._build_conservative_rename_prompt(
+            pseudocode, context, candidates
+        )
+        content = self._request_code(
+            prompt,
+            "conservative_rename_plan",
+            temperature=0.0,
+            conservative=True,
+            cancel_event=cancel_event,
+            max_tokens=min(
+                int(self.max_tokens) if str(self.max_tokens).isdigit() else 384,
+                384,
+            ),
+            system_content=(
+                "Return only a compact JSON object mapping allowed IDA local "
+                "variables to conservative snake_case names. Never return C code."
+            ),
+        )
+        if content is None:
+            return None
+        plan = self._parse_rename_plan(content)
+        if plan is None:
+            self.last_error = "模型未返回有效的局部变量重命名 JSON"
+            self.logger.warning(self.last_error)
+            return None
+        return plan
 
     def repair_code(
         self, pseudocode: str, context: dict = None, violation: str = "",
-        required_anchors: str = "",
+        required_anchors: str = "", cancel_event=None,
     ) -> Optional[str]:
         """Ask once for an invariant-preserving replacement after a rejection.
 
@@ -564,7 +735,8 @@ class LLMClient:
             prompt,
             "quality_repair",
             temperature=0.0,
-            conservative=self._should_use_conservative(pseudocode),
+            conservative=False,
+            cancel_event=cancel_event,
         )
 
     def _post_process_code(self, code: str) -> str:
@@ -775,8 +947,7 @@ class LLMClient:
         try:
             from urllib.parse import urlparse
 
-            parsed = urlparse(self.api_url)
-            models_url = f"{parsed.scheme}://{parsed.netloc}/v1/models"
+            models_url = self._models_url_from_api_url(self.api_url)
             headers = {}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"

@@ -317,24 +317,24 @@ class ResultPresenter:
 
 
 class ProgressDialog:
-    """进度对话框"""
+    """Output-window progress reporter kept for the synchronous path."""
 
     def __init__(self, title: str = "CHelper正在处理..."):
         self.title = title
         self.cancelled = False
 
     def __enter__(self):
-        ida_kernwin.show_wait_box(self.title)
+        ResultPresenter.print_to_output(self.title)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        ida_kernwin.hide_wait_box()
+        return False
 
     def update(self, message: str):
-        ida_kernwin.replace_wait_box(message)
+        ResultPresenter.print_to_output(message)
 
     def check_cancelled(self) -> bool:
-        return ida_kernwin.user_cancelled()
+        return False
 
 
 class OptimizedCodeViewer(ida_kernwin.simplecustviewer_t):
@@ -358,9 +358,14 @@ class OptimizedCodeViewer(ida_kernwin.simplecustviewer_t):
     def build_title(self) -> str:
         function_name = self.context.get("function_name", "unknown")
         address = self.context.get("address", "")
+        prefix = (
+            "CHelper 未通过安全检测"
+            if self.context.get("result_kind") == "model_rejected_candidate"
+            else "CHelper"
+        )
         if address:
-            return f"CHelper - {function_name} @ {address}"
-        return f"CHelper - {function_name}"
+            return f"{prefix} - {function_name} @ {address}"
+        return f"{prefix} - {function_name}"
 
     def _add_line(self, text: str):
         self._lines.append(text)
@@ -391,11 +396,17 @@ class OptimizedCodeViewer(ida_kernwin.simplecustviewer_t):
             label = (
                 "CHelper 本地安全美化"
                 if result_kind == "local_readability_fallback"
+                else "CHelper 模型候选（未通过安全检测）"
+                if result_kind == "model_rejected_candidate"
                 else "CHelper 模型全量重写"
                 if result_kind == "model_full_rewrite"
-                else "CHelper 模型保守美化"
+                else "CHelper 模型辅助命名"
             )
             self._add_line(f"// {label}")
+            if result_kind == "model_rejected_candidate":
+                self._add_line(
+                    "// 警告: 此候选未被安全流程采用，仅供人工审阅，不会缓存或写回 IDA"
+                )
             if function_name:
                 self._add_line(f"// 函数: {function_name}")
             if address:
@@ -425,6 +436,18 @@ class OptimizedCodeViewer(ida_kernwin.simplecustviewer_t):
             pass
 
     def OnKeydown(self, vkey, shift):
+        """Handle shortcuts that IDA does not dispatch for custom viewers."""
+        ctrl_mask = getattr(ida_kernwin, "VES_CTRL", 4)
+        if shift & ctrl_mask and vkey in (ord("A"), ord("a")):
+            try:
+                # ``simplecustviewer_t`` exposes selection reading but no
+                # selection setter. Trigger IDA's native action explicitly so
+                # the visible range is selected and the normal Copy action can
+                # consume it afterwards.
+                if ida_kernwin.process_ui_action("SelectAll"):
+                    return True
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                get_logger().debug(f"Ctrl+A 全选失败: {exc}")
         return False
 
     def OnCursorPosChanged(self):

@@ -7,12 +7,15 @@ import os
 import json
 import hashlib
 import time
+import tempfile
 from typing import Optional, Dict, Any
+
+from .constants import PROMPT_VERSION
 
 
 # v3 invalidates entries produced before semantic validation.  Earlier
 # versions could cache the original code after an invalid model response.
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 
 
 class OptimizationCache:
@@ -161,17 +164,21 @@ class OptimizationCache:
             "metadata": metadata or {},
         }
 
-        temp_path = cache_path + ".tmp"
+        temp_path = None
         try:
-            # Atomic replacement prevents a killed IDA process from leaving a
-            # partially-written JSON file that can poison future lookups.
-            with open(temp_path, 'w', encoding='utf-8') as f:
+            # A unique same-directory temporary file avoids concurrent writers
+            # clobbering one another before the final atomic replacement.
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f".{cache_hash}.", suffix=".tmp", dir=self.cache_dir
+            )
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(temp_path, cache_path)
+            temp_path = None
         except Exception as e:
             print(f"[CHelper Cache] 保存缓存失败: {e}")
             try:
-                if os.path.exists(temp_path):
+                if temp_path and os.path.exists(temp_path):
                     os.remove(temp_path)
             except Exception:
                 pass
@@ -295,18 +302,22 @@ def init_cache(config) -> OptimizationCache:
         # Keep secrets such as api_key out of the namespace while including
         # every setting that can affect the generated result.
         namespace_payload = {
-            "plugin_version": "1.3.1",
-            "prompt_version": "safe-c-v8",
+            "plugin_version": "1.4.0",
+            "prompt_version": PROMPT_VERSION,
             "llm": {
                 key: config.get(f"llm.{key}")
                 for key in (
                     "model", "temperature", "max_tokens", "repeat_penalty",
                     "frequency_penalty", "presence_penalty", "top_p", "top_k",
                     "min_p", "send_extended_parameters", "conservative_mode",
+                    "conservative_model_renames",
                     "backend", "api_url",
-                    "strip_reasoning", "reasoning_tags", "reasoning", "reasoning_budget", "seed",
-                    "quality_guard", "minimum_output_ratio", "restore_unused_parameter_signature",
+                    "strip_reasoning", "reasoning_tags", "reasoning",
+                    "reasoning_effort", "reasoning_budget", "seed",
+                    "quality_guard", "quality_guard_profile", "minimum_output_ratio",
+                    "restore_unused_parameter_signature",
                     "quality_repair_attempts", "local_readability_fallback",
+                    "degeneration_guard",
                 )
             },
             "optimization": config.get("optimization", {}),
@@ -332,3 +343,9 @@ def get_cache() -> Optional[OptimizationCache]:
         OptimizationCache 实例，未初始化返回 None
     """
     return _global_cache
+
+
+def reset_cache():
+    """Drop the process-wide cache instance during plugin unload/reload."""
+    global _global_cache
+    _global_cache = None

@@ -13,17 +13,17 @@ class Config:
     # 默认配置
     DEFAULT_CONFIG = {
         "llm": {
-            "api_url": "http://127.0.0.1:11434/v1/chat/completions",  # Ollama OpenAI兼容API
-            "model": "qwen2.5-coder:7b",
+            "api_url": "http://127.0.0.1:8000/v1/chat/completions",
+            "model": "DeepSeek-R1-SFT-Q4_K_M.gguf",
             "temperature": 0.0,
             "max_tokens": 2048,
             "timeout": 300,
             "api_key": "",  # 本地模型通常不需要
-            "strip_reasoning": False,  # Qwen Coder 非推理模型无需剥离 <think>
+            "strip_reasoning": True,
             "reasoning_tags": ["think", "thinking"],
-            "auto_start": False,  # Ollama 由用户服务管理，不启动额外 llama-server
+            "auto_start": True,
             "backend": "llama_cpp",  # "llama_cpp" | "vllm" | "openai"
-            "model_path": "",  # 外部 Ollama 端点无需本地模型路径
+            "model_path": "DeepSeek-R1-SFT-Q4_K_M.gguf",
             "vllm_binary": "vllm",  # vLLM 可执行文件名
             "llama_server_binary": "",  # llama-server 路径，空则自动找插件目录/.llama_bin/
             "n_gpu_layers": -1,  # llama.cpp  offload 到 GPU 的层数，-1 表示全部
@@ -41,21 +41,22 @@ class Config:
             # 推理模板会消耗 token 且容易让小模型在最终代码前跑偏。
             # llama.cpp 后端可用 "off" / "on" / "auto"。
             "reasoning": "off",
+            # OpenAI/Ollama chat API reasoning control: none/low/medium/high/max.
+            "reasoning_effort": None,
             # llama.cpp：0 表示立即结束 <think>，避免推理模型挤占代码 token。
             "reasoning_budget": 0,
             # --- 保守模式（治小模型重建复杂逻辑失败） ---
             # IDA 伪代码包含 ABI、全局符号等高风险细节；默认只做保守美化。
             "conservative_mode": "on",
-            "degeneration_guard": True,  # 后处理退化检测兜底，发现重复行自动截断
-            # on/auto 要求保留高信号锚点；off 仍检查签名、长度和新增调用。
+            # 保守模式只让模型返回短 JSON 命名建议，代码替换由插件本地完成。
+            "conservative_model_renames": True,
+            # 安全总开关；False 时直接展示模型候选。
             "quality_guard": True,
-            "minimum_output_ratio": 0.45,
-            # 参数在函数体内完全未使用时，恢复模型误改的 IDA ABI 签名。
-            "restore_unused_parameter_signature": True,
-            # 保守模型输出只能改局部标识符；无变化/失败时使用确定性本地美化。
-            "local_readability_fallback": True,
-            # 质量门拒绝完整输出后，仅以原始伪代码为权威进行一次修复请求。
-            "quality_repair_attempts": 1,
+            # "strict" | "balanced" | "globals_only"
+            # globals_only 只冻结 byte_*/g_*/dword_* 等 IDA 全局符号。
+            "quality_guard_profile": "balanced",
+            # 仅在模型候选最终未被安全流程采用时展示；不缓存不写回 IDA。
+            "show_rejected_candidate": False,
             # 设为整数可复现采样；None 使用后端默认随机种子。
             "seed": None,
             # --- 网络重试 ---
@@ -74,6 +75,7 @@ class Config:
             "cache_dir": ".cache",  # 缓存目录（相对插件目录）
             "cache_max_age_days": 30,  # 缓存最大有效期（天）
             "cache_cleanup_on_start": True,  # 启动时清理过期缓存
+            "service_log_file": "",  # 后端 stdout/stderr；为空则使用 .debug/
         },
         "optimization": {
             "deobfuscate_ollvm": True,
@@ -104,7 +106,13 @@ class Config:
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
-                    user_config = json.load(f)
+                    # config.json accepts JSONC-style comments so related
+                    # options can be documented next to their values.  The
+                    # stripper is string-aware and therefore preserves URLs
+                    # such as ``http://127.0.0.1`` and comment-like prompt text.
+                    user_config = json.loads(
+                        self._strip_json_comments(f.read())
+                    )
                 # 合并用户配置和默认配置
                 config = self._merge_config(copy.deepcopy(self.DEFAULT_CONFIG), user_config)
                 return config
@@ -115,6 +123,62 @@ class Config:
             # 创建默认配置文件
             self.save_config(self.DEFAULT_CONFIG)
             return copy.deepcopy(self.DEFAULT_CONFIG)
+
+    @staticmethod
+    def _strip_json_comments(source: str) -> str:
+        """Remove // and /* */ comments without modifying JSON strings."""
+        if not source:
+            return source
+
+        output = []
+        index = 0
+        in_string = False
+        escaped = False
+        length = len(source)
+
+        while index < length:
+            char = source[index]
+            next_char = source[index + 1] if index + 1 < length else ""
+
+            if in_string:
+                output.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                index += 1
+                continue
+
+            if char == '"':
+                in_string = True
+                output.append(char)
+                index += 1
+                continue
+
+            if char == "/" and next_char == "/":
+                index += 2
+                while index < length and source[index] not in "\r\n":
+                    index += 1
+                continue
+
+            if char == "/" and next_char == "*":
+                index += 2
+                while index < length:
+                    if source[index] == "*" and index + 1 < length and source[index + 1] == "/":
+                        index += 2
+                        break
+                    # Preserve line positions for useful JSON error messages.
+                    if source[index] in "\r\n":
+                        output.append(source[index])
+                    index += 1
+                continue
+
+            output.append(char)
+            index += 1
+
+        return "".join(output)
 
     def _merge_config(self, default, user):
         """递归合并配置"""
@@ -200,3 +264,9 @@ def get_config():
     if _global_config is None:
         _global_config = Config()
     return _global_config
+
+
+def reset_config():
+    """Drop the process-wide configuration so a plugin reload rereads disk."""
+    global _global_config
+    _global_config = None
